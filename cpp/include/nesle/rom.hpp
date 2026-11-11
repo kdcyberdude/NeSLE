@@ -36,12 +36,20 @@ struct RomMetadata {
 constexpr std::uint8_t kBankKindNone = 0;
 constexpr std::uint8_t kBankKindUxrom16k = 1;
 constexpr std::uint8_t kBankKindBnrom32k = 2;
+constexpr std::uint8_t kBankKindCnrom = 3;
+constexpr std::uint8_t kBankKindMmc1 = 4;
+constexpr std::uint8_t kBankKindMmc2 = 5;
+constexpr std::uint8_t kBankKindMmc3 = 6;
 
 // iNES mapper numbers with a banking path. Mirrored in nesle::cuda.
 constexpr std::uint16_t kMapperNrom = 0;
 constexpr std::uint16_t kMapperUxrom = 2;
 constexpr std::uint16_t kMapperBnrom = 34;
 constexpr std::uint16_t kMapperUn1rom = 94;
+constexpr std::uint16_t kMapperMmc1 = 1;
+constexpr std::uint16_t kMapperCnrom = 3;
+constexpr std::uint16_t kMapperMmc3 = 4;
+constexpr std::uint16_t kMapperMmc2 = 9;
 
 // Window geometry of a banked cartridge, derived once from the iNES header.
 // `window_bytes == 0` means the board has no register at all (NROM), which is
@@ -54,6 +62,11 @@ struct MapperLayout {
     std::uint8_t bank_kind = 0;       // nesle::cuda::BankKind
     bool bus_conflicts = false;
     bool supported = false;
+    // Paged boards (CNROM, MMC1, MMC2, MMC3): 8 KB PRG pages - 1 and 1 KB CHR
+    // pages - 1 (of the CHR ROM, or of 8 KB CHR RAM). The window fields above
+    // stay zero for them.
+    std::uint16_t prg_page_mask = 0;
+    std::uint16_t chr_page_mask = 0;
 };
 
 struct RomImage {

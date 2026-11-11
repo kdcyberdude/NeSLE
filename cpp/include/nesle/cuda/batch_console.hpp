@@ -47,17 +47,30 @@ step_batch_console_instruction_hot(BatchBuffers& buffers,
         hot.nmi_pending = 0;
         cpu::nmi(state, bus);
         nmi_serviced = true;
+    } else if (mapper_irq_asserted<Mode>(buffers, env) &&
+               (state.p & cpu::InterruptDisable) == 0) {
+        // Level-triggered cartridge IRQ (MMC3); the board keeps the line
+        // asserted until the game acknowledges it, as FCEUmm's X6502 does.
+        cpu::irq(state, bus);
     }
 
+    hot.now = hot.frame_dot + static_cast<std::uint32_t>(state.cycles - cycles_before) * kPpuCyclesPerCpuCycle;
+    const auto logged_before = hot.log_n;
     const auto cpu_step = cpu::step(state, bus);
+    if (hot.log_n != logged_before) {
+        frame_log_set_cycles(buffers, env, hot, logged_before, cpu_step.cycles);
+    }
     if (buffers.cpu.pending_dma_cycles != nullptr && buffers.cpu.pending_dma_cycles[env] != 0) {
         state.cycles += buffers.cpu.pending_dma_cycles[env];
         buffers.cpu.pending_dma_cycles[env] = 0;
     }
+    if (buffers.apu.dmc_event != nullptr && state.cycles >= buffers.apu.dmc_event[env]) {
+        state.cycles += service_dmc_env(buffers, env, state.cycles, true);
+    }
 
     const auto cpu_cycles = static_cast<std::uint32_t>(state.cycles - cycles_before);
     const auto ppu_cycles = cpu_cycles * kPpuCyclesPerCpuCycle;
-    const auto ppu_step = batch_ppu_step_env_hot(buffers, env, ppu_cycles, hot);
+    const auto ppu_step = batch_ppu_step_env_hot<Mode>(buffers, env, ppu_cycles, hot);
 
     return BatchConsoleStepResult{
         cpu_step,
@@ -75,12 +88,15 @@ step_batch_console_instruction_hot(BatchBuffers& buffers,
 // (PPU scalar state — status bits, nmi_pending — changes exclusively at the
 // three timing events, so between events the register-resident snapshot the
 // bus reads is exact). See the console step kernel for the settle protocol.
+// `pending_dots` is that un-settled span: the frame log stamps PPU writes with
+// the dot they really happen at.
 template <BankMode Mode = kBankModeRuntime>
 [[nodiscard]] NESLE_CUDA_BATCH_CONSOLE_HD inline BatchConsoleStepResult
 step_batch_console_instruction_lazy(BatchBuffers& buffers,
                                     std::uint32_t env,
                                     cpu::CpuState& state,
-                                    PpuHotState& hot) {
+                                    PpuHotState& hot,
+                                    std::uint32_t pending_dots = 0) {
     const auto cycles_before = state.cycles;
     bool nmi_serviced = false;
     BatchCpuBusT<Mode> bus(buffers, env, hot);
@@ -89,12 +105,26 @@ step_batch_console_instruction_lazy(BatchBuffers& buffers,
         hot.nmi_pending = 0;
         cpu::nmi(state, bus);
         nmi_serviced = true;
+    } else if (mapper_irq_asserted<Mode>(buffers, env) &&
+               (state.p & cpu::InterruptDisable) == 0) {
+        // Level-triggered cartridge IRQ (MMC3); the board keeps the line
+        // asserted until the game acknowledges it, as FCEUmm's X6502 does.
+        cpu::irq(state, bus);
     }
 
+    hot.now = hot.frame_dot + pending_dots +
+              static_cast<std::uint32_t>(state.cycles - cycles_before) * kPpuCyclesPerCpuCycle;
+    const auto logged_before = hot.log_n;
     const auto cpu_step = cpu::step(state, bus);
+    if (hot.log_n != logged_before) {
+        frame_log_set_cycles(buffers, env, hot, logged_before, cpu_step.cycles);
+    }
     if (buffers.cpu.pending_dma_cycles != nullptr && buffers.cpu.pending_dma_cycles[env] != 0) {
         state.cycles += buffers.cpu.pending_dma_cycles[env];
         buffers.cpu.pending_dma_cycles[env] = 0;
+    }
+    if (buffers.apu.dmc_event != nullptr && state.cycles >= buffers.apu.dmc_event[env]) {
+        state.cycles += service_dmc_env(buffers, env, state.cycles, true);
     }
 
     const auto cpu_cycles = static_cast<std::uint32_t>(state.cycles - cycles_before);
@@ -130,12 +160,18 @@ step_batch_console_instruction(BatchBuffers& buffers, std::uint32_t env) {
     return result;
 }
 
+template <BankMode Mode = kBankModeRuntime>
 [[nodiscard]] NESLE_CUDA_BATCH_CONSOLE_HD inline BatchConsoleStepResult
 fast_forward_batch_console_idle_loop_hot(BatchBuffers& buffers,
                                          std::uint32_t env,
                                          cpu::CpuState& state,
                                          PpuHotState& hot) {
-    const auto ppu_cycles_to_event = batch_ppu_cycles_until_next_timing_event_hot(hot);
+    if (hot.nmi_pending != 0) {
+        // The settle before this raised NMI (an event can now fall a few dots before
+        // vblank, e.g. the replay's early vblank flag): take it, do not skip past it.
+        return {};
+    }
+    const auto ppu_cycles_to_event = batch_ppu_cycles_until_next_event_hot<Mode>(buffers, env, hot);
     const auto skipped_jumps = (ppu_cycles_to_event + 8u) / 9u;
     if (skipped_jumps == 0) {
         return {};
@@ -144,7 +180,10 @@ fast_forward_batch_console_idle_loop_hot(BatchBuffers& buffers,
     const auto cpu_cycles = skipped_jumps * 3u;
     const auto ppu_cycles = cpu_cycles * kPpuCyclesPerCpuCycle;
     state.cycles += cpu_cycles;
-    const auto ppu_step = batch_ppu_step_env_hot(buffers, env, ppu_cycles, hot);
+    if (buffers.apu.dmc_event != nullptr && state.cycles >= buffers.apu.dmc_event[env]) {
+        (void)service_dmc_env(buffers, env, state.cycles, false);
+    }
+    const auto ppu_step = batch_ppu_step_env_hot<Mode>(buffers, env, ppu_cycles, hot);
     return BatchConsoleStepResult{
         {},
         cpu_cycles,

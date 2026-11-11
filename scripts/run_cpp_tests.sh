@@ -23,6 +23,7 @@ run test_fcs
 run test_headless cpp/src/rom.cpp cpp/src/smb.cpp
 run test_cuda_batch cpp/src/smb.cpp
 run test_cuda_bus cpp/src/rom.cpp
+run test_cuda_apu
 run test_cuda_cpu_step cpp/src/rom.cpp
 run test_cuda_batch_runner cpp/src/rom.cpp
 run test_cuda_ppu

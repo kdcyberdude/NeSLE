@@ -9,6 +9,8 @@
 #include <string>
 #include <string_view>
 
+#include "nesle/rom.hpp"
+
 namespace nesle::fcs {
 
 inline constexpr std::size_t kCpuRamBytes = 2048;
@@ -57,7 +59,40 @@ struct StateSnapshot {
     // mask, so both reduce to the same expression.
     std::uint8_t cart_latch = 0;
     bool has_cart_latch = false;
+
+    // Paged-board registers (section 16) under FCEUmm's chunk names. A state carries
+    // only its own board's chunks; board_registers() maps them onto NeSLE's register
+    // layout (cuda/mapper.cuh) once the board is known.
+    std::array<std::uint8_t, 8> board_regs{};  // MMC1 "DREG" (4), MMC2 "CREG" (4), MMC3 "REGS" (8)
+    std::uint8_t board_regs_size = 0;
+    std::uint8_t mmc1_shift = 0;        // "BFFR"
+    std::uint8_t mmc1_shift_count = 0;  // "BFRS"
+    std::uint8_t mmc2_prg = 0;          // "PREG"
+    std::uint8_t mmc2_mirroring = 0;    // "MIRR": 1 = vertical, as the board stores it
+    std::uint8_t mmc2_latch0 = 1;       // "LAT0": 0 = $FD bank, 1 = $FE bank
+    std::uint8_t mmc2_latch1 = 1;       // "LAT1"
+    std::uint8_t mmc3_cmd = 0;          // "CMD"
+    std::uint8_t mmc3_a000 = 0;         // "A000" (mirroring)
+    std::uint8_t mmc3_a001 = 0;         // "A001"
+    std::uint8_t mmc3_irq_reload = 0;   // "IRQR"
+    std::uint8_t mmc3_irq_count = 0;    // "IRQC"
+    std::uint8_t mmc3_irq_latch = 0;    // "IRQL"
+    std::uint8_t mmc3_irq_enabled = 0;  // "IRQA"
+    std::uint32_t board_chunks = 0;     // kBoard* bits of the chunks seen
+
+    // CPU section 2 (X6502 internals): the IRQ line bits ("IQLB"; bit 0 is the
+    // cartridge's line) and the CPU's distance from the end of the frame it was saved
+    // at ("ICou", in 1/48 CPU cycles; negative = the last instruction ran past it).
+    std::uint32_t cpu_irq_low = 0;
+    std::int32_t cpu_count = 0;
+    // PPU "KOOK": FCEUmm's odd/even frame toggle for the frame that comes next.
+    std::uint8_t ppu_kook = 0;
 };
+
+inline constexpr std::uint32_t kBoardDreg = 1u << 0, kBoardBffr = 1u << 1, kBoardBfrs = 1u << 2,
+                               kBoardCreg = 1u << 3, kBoardPreg = 1u << 4, kBoardMirr = 1u << 5,
+                               kBoardLat0 = 1u << 6, kBoardLat1 = 1u << 7, kBoardRegs = 1u << 8,
+                               kBoardCmd = 1u << 9, kBoardA000 = 1u << 10, kBoardIrq = 1u << 11;
 
 namespace detail {
 
@@ -160,8 +195,19 @@ inline void apply_ppu_subchunk(StateSnapshot& out, std::string_view name,
         out.ppu_read_buffer = payload[0];
     } else if (name == "PGEN" && payload.size() == 1) {
         out.ppu_open_bus = payload[0];
+    } else if (name == "KOOK" && payload.size() == 1) {
+        out.ppu_kook = static_cast<std::uint8_t>(payload[0] & 1u);
     }
-    // KOOK, DEAD are vs-system / debug flags; we ignore them.
+    // DEAD (power-on frames left) is ignored.
+}
+
+inline void apply_cpu_internal_subchunk(StateSnapshot& out, std::string_view name,
+                                        std::span<const std::uint8_t> payload) {
+    if (name == "IQLB" && payload.size() == 4) {
+        out.cpu_irq_low = read_le_u32(payload);
+    } else if (name == "ICou" && payload.size() == 4) {
+        out.cpu_count = static_cast<std::int32_t>(read_le_u32(payload));
+    }
 }
 
 inline void apply_cart_subchunk(StateSnapshot& out, std::string_view name,
@@ -194,6 +240,31 @@ inline void apply_cart_subchunk(StateSnapshot& out, std::string_view name,
             out.cart_latch = payload[0];
             out.has_cart_latch = true;
         }
+        // MMC3 keeps R0-R7 here.
+        if (payload.size() == 8) {
+            std::memcpy(out.board_regs.data(), payload.data(), 8);
+            out.board_regs_size = 8;
+            out.board_chunks |= kBoardRegs;
+        }
+    } else if ((name == "DREG" || name == "CREG") && payload.size() == 4) {
+        std::memcpy(out.board_regs.data(), payload.data(), 4);
+        out.board_regs_size = 4;
+        out.board_chunks |= name == "DREG" ? kBoardDreg : kBoardCreg;
+    } else if (payload.size() == 1) {
+        const std::uint8_t v = payload[0];
+        if (name == "BFFR") { out.mmc1_shift = v; out.board_chunks |= kBoardBffr; }
+        else if (name == "BFRS") { out.mmc1_shift_count = v; out.board_chunks |= kBoardBfrs; }
+        else if (name == "PREG") { out.mmc2_prg = v; out.board_chunks |= kBoardPreg; }
+        else if (name == "MIRR") { out.mmc2_mirroring = v; out.board_chunks |= kBoardMirr; }
+        else if (name == "LAT0") { out.mmc2_latch0 = v; out.board_chunks |= kBoardLat0; }
+        else if (name == "LAT1") { out.mmc2_latch1 = v; out.board_chunks |= kBoardLat1; }
+        else if (name == "CMD") { out.mmc3_cmd = v; out.board_chunks |= kBoardCmd; }
+        else if (name == "A000") { out.mmc3_a000 = v; out.board_chunks |= kBoardA000; }
+        else if (name == "A001") { out.mmc3_a001 = v; }
+        else if (name == "IRQR") { out.mmc3_irq_reload = v; out.board_chunks |= kBoardIrq; }
+        else if (name == "IRQC") { out.mmc3_irq_count = v; }
+        else if (name == "IRQL") { out.mmc3_irq_latch = v; }
+        else if (name == "IRQA") { out.mmc3_irq_enabled = v; }
     }
 }
 
@@ -268,6 +339,9 @@ inline void require_subchunks(std::span<const std::uint8_t> payload, std::string
                 detail::require_subchunks(payload, "CPU", {"PC", "RAM"});
                 has_cpu = true;
                 break;
+            case 2:  // X6502 internals: IRQ line, cycle count
+                detail::walk_subchunks(payload, detail::apply_cpu_internal_subchunk, out);
+                break;
             case 3:  // PPU + VRAM
                 detail::walk_subchunks(payload, detail::apply_ppu_subchunk, out);
                 detail::require_subchunks(payload, "PPU", {"NTAR", "PRAM", "SPRA", "PPUR"});
@@ -277,7 +351,7 @@ inline void require_subchunks(std::span<const std::uint8_t> payload, std::string
                 detail::walk_subchunks(payload, detail::apply_cart_subchunk, out);
                 break;
             default:
-                // Tags 2 (input), 4 (joypad config), 5 (APU/sound) are intentionally skipped.
+                // Tags 4 (input), 5 (APU/sound) are intentionally skipped.
                 break;
         }
         off += size;
@@ -289,6 +363,51 @@ inline void require_subchunks(std::span<const std::uint8_t> payload, std::string
         throw std::runtime_error("FCS: state has no CPU or no PPU section");
     }
     return out;
+}
+
+// The 16 board register bytes NeSLE keeps for a paged board (layout in cuda/mapper.cuh)
+// and the board's IRQ line, from the chunks FCEUmm saved. `bank_kind` is the cartridge's
+// MapperLayout::bank_kind. Returns false when the state lacks the board's registers
+// (it was saved for another board, or by an emulator that does not write them).
+[[nodiscard]] inline bool board_registers(const StateSnapshot& s, std::uint8_t bank_kind,
+                                          std::array<std::uint8_t, 16>& regs,
+                                          std::uint8_t& irq_line) {
+    regs.fill(0);
+    irq_line = 0;
+    switch (bank_kind) {
+        case kBankKindCnrom:
+            if (!s.has_cart_latch) return false;
+            regs[0] = s.cart_latch;  // datalatch.c "LATC": the byte the board latched
+            return true;
+        case kBankKindMmc1:
+            if ((s.board_chunks & kBoardDreg) == 0) return false;
+            for (int i = 0; i < 4; ++i) regs[i] = s.board_regs[i];  // control, CHR 0, CHR 1, PRG
+            regs[4] = s.mmc1_shift;
+            regs[5] = s.mmc1_shift_count;
+            return true;
+        case kBankKindMmc2:
+            if ((s.board_chunks & kBoardCreg) == 0) return false;
+            for (int i = 0; i < 4; ++i) regs[i] = s.board_regs[i];  // $FD/0, $FE/0, $FD/1, $FE/1
+            regs[4] = s.mmc2_prg;
+            regs[5] = s.mmc2_mirroring;
+            regs[6] = static_cast<std::uint8_t>(s.mmc2_latch0 & 1u);
+            regs[7] = static_cast<std::uint8_t>(s.mmc2_latch1 & 1u);
+            return true;
+        case kBankKindMmc3:
+            if ((s.board_chunks & kBoardRegs) == 0 || (s.board_chunks & kBoardCmd) == 0) return false;
+            for (int i = 0; i < 8; ++i) regs[i] = s.board_regs[i];  // R0-R7
+            regs[8] = s.mmc3_cmd;
+            regs[9] = s.mmc3_a000;
+            regs[10] = s.mmc3_a001;
+            regs[11] = s.mmc3_irq_latch;
+            regs[12] = s.mmc3_irq_count;
+            regs[13] = s.mmc3_irq_enabled;
+            regs[14] = s.mmc3_irq_reload;
+            irq_line = static_cast<std::uint8_t>(s.cpu_irq_low & 1u);  // FCEU_IQEXT
+            return true;
+        default:
+            return false;
+    }
 }
 
 [[nodiscard]] inline StateSnapshot parse(const std::string& bytes) {

@@ -2,6 +2,8 @@
 
 #include <cstdint>
 
+#include "nesle/cuda/batch_apu.cuh"
+#include "nesle/cuda/batch_frame.cuh"
 #include "nesle/cuda/mapper.cuh"
 #include "nesle/cuda/state.cuh"
 
@@ -48,8 +50,7 @@ NESLE_CUDA_HD inline std::uint8_t bus_ppu_memory_read(BatchBuffers& buffers,
             address = static_cast<std::uint16_t>(address - 0x1000);
         }
         return buffers.ppu.nametable_ram[static_cast<std::uint64_t>(env) * kNametableRamBytes +
-                                        mirror_nametable_address(
-                                            env_nametable_arrangement<Mode>(buffers, env), address)];
+                                        env_mirror_nametable_address<Mode>(buffers, env, address)];
     }
     return buffers.ppu.palette_ram[
         static_cast<std::uint64_t>(env) * kPaletteRamBytes + bus_mirror_palette_address(address)];
@@ -62,7 +63,7 @@ NESLE_CUDA_HD inline void bus_ppu_memory_write(BatchBuffers& buffers,
                                                std::uint8_t value) {
     address = static_cast<std::uint16_t>(address & 0x3FFF);
     if (address < 0x2000) {
-        write_chr(buffers, env, address, value);
+        write_chr<Mode>(buffers, env, address, value);
         return;
     }
     if (address < 0x3F00) {
@@ -70,12 +71,68 @@ NESLE_CUDA_HD inline void bus_ppu_memory_write(BatchBuffers& buffers,
             address = static_cast<std::uint16_t>(address - 0x1000);
         }
         buffers.ppu.nametable_ram[static_cast<std::uint64_t>(env) * kNametableRamBytes +
-                                  mirror_nametable_address(
-                                      env_nametable_arrangement<Mode>(buffers, env), address)] = value;
+                                  env_mirror_nametable_address<Mode>(buffers, env, address)] = value;
         return;
     }
     buffers.ppu.palette_ram[static_cast<std::uint64_t>(env) * kPaletteRamBytes +
                             bus_mirror_palette_address(address)] = value;
+}
+
+// The VRAM address the CPU puts on the PPU bus ($2006/$2007): MMC2 latch flips, logged
+// for the renderer while a frame is drawn.
+template <BankMode Mode = kBankModeRuntime>
+NESLE_CUDA_HD inline void bus_ppu_address(BatchBuffers& buffers,
+                                          std::uint32_t env,
+                                          std::uint16_t address,
+                                          PpuHotState* hot) {
+    if constexpr (Mode == kBankModePaged || Mode == kBankModeRuntime) {
+        if (buffers.cart.bank_kind == kBankingMmc2 && buffers.mapper.regs != nullptr) {
+            const std::uint8_t* r = paged::regs(buffers, env);
+            const std::uint8_t latch0 = r[paged::kMmc2Latch0];
+            const std::uint8_t latch1 = r[paged::kMmc2Latch1];
+            paged::mmc2_ppu_address(buffers, env, address);
+            if (r[paged::kMmc2Latch0] != latch0) {
+                frame_log_event(buffers, env, hot, kEvMmc2, r[paged::kMmc2Latch0], paged::kMmc2Latch0);
+            }
+            if (r[paged::kMmc2Latch1] != latch1) {
+                frame_log_event(buffers, env, hot, kEvMmc2, r[paged::kMmc2Latch1], paged::kMmc2Latch1);
+            }
+        }
+    }
+}
+
+// A board register write. While a frame is drawn, the CHR pages, mirroring and MMC2
+// CHR registers it changes are logged for the renderer.
+template <BankMode Mode = kBankModeRuntime>
+NESLE_CUDA_HD inline void bus_write_mapper(BatchBuffers& buffers,
+                                           std::uint32_t env,
+                                           std::uint16_t address,
+                                           std::uint8_t value,
+                                           PpuHotState* hot) {
+    if constexpr (Mode == kBankModePaged || Mode == kBankModeRuntime) {
+        if (cart_is_paged<Mode>(buffers.cart) && frame_log_active(buffers, hot)) {
+            const std::uint32_t* pages = buffers.mapper.chr_page + static_cast<std::uint64_t>(env) * kChrPages;
+            const std::uint8_t* r = paged::regs(buffers, env);
+            std::uint32_t before[8];
+            for (int i = 0; i < 8; ++i) before[i] = pages[i];
+            const std::uint8_t mirroring = buffers.mapper.mirroring[env];
+            const std::uint32_t creg = r[0] | (r[1] << 8) | (r[2] << 16) | (static_cast<std::uint32_t>(r[3]) << 24);
+            write_mapper_register<Mode>(buffers, env, address, value);
+            for (std::uint32_t i = 0; i < 8u; ++i) {
+                if (pages[i] != before[i]) frame_log_event(buffers, env, hot, kEvChr, pages[i] >> 10, i);
+            }
+            if (buffers.mapper.mirroring[env] != mirroring) {
+                frame_log_event(buffers, env, hot, kEvMirror, buffers.mapper.mirroring[env]);
+            }
+            if (buffers.cart.bank_kind == kBankingMmc2) {
+                for (std::uint32_t i = 0; i < 4u; ++i) {
+                    if (r[i] != ((creg >> (8u * i)) & 0xFFu)) frame_log_event(buffers, env, hot, kEvMmc2, r[i], i);
+                }
+            }
+            return;
+        }
+    }
+    write_mapper_register<Mode>(buffers, env, address, value);
 }
 
 NESLE_CUDA_HD inline void bus_increment_vram_address(BatchBuffers& buffers,
@@ -172,15 +229,22 @@ NESLE_CUDA_HD inline std::uint8_t batch_cpu_read(BatchBuffers& buffers,
                 value = bus_ppu_memory_read<Mode>(buffers, env, ppu_address);
                 buffers.ppu.read_buffer[env] =
                     bus_ppu_memory_read<Mode>(buffers, env, static_cast<std::uint16_t>(ppu_address - 0x1000));
+                bus_ppu_address<Mode>(buffers, env, ppu_address, hot);
             } else {
                 value = buffers.ppu.read_buffer[env];
+                bus_ppu_address<Mode>(buffers, env, ppu_address, hot);
                 buffers.ppu.read_buffer[env] = bus_ppu_memory_read<Mode>(buffers, env, ppu_address);
             }
             bus_increment_vram_address(buffers, env, hot);
+            frame_log_event(buffers, env, hot, kEvDataRead, 0);
+            bus_ppu_address<Mode>(buffers, env, static_cast<std::uint16_t>(buffers.ppu.v[env] & 0x3FFF), hot);
             buffers.ppu.open_bus[env] = value;
             return value;
         }
         return 0;
+    }
+    if (address == 0x4015) {
+        return read_apu_status(buffers, env);
     }
     if (address == 0x4016) {
         return read_controller1(buffers, env);
@@ -190,6 +254,11 @@ NESLE_CUDA_HD inline std::uint8_t batch_cpu_read(BatchBuffers& buffers,
         return 0x40;
     }
     if (address >= 0x6000 && address < 0x8000) {
+        if (!mapper_prg_ram_enabled<Mode>(buffers, env)) {
+            // Disabled board RAM: open bus, which after an absolute or indirect
+            // fetch still holds the address high byte.
+            return static_cast<std::uint8_t>(address >> 8);
+        }
         return env_prg_ram(buffers, env)[address - 0x6000];
     }
     if (address >= 0x8000) {
@@ -227,18 +296,21 @@ NESLE_CUDA_HD inline void batch_cpu_write(BatchBuffers& buffers,
             }
             buffers.ppu.t[env] =
                 static_cast<std::uint16_t>((buffers.ppu.t[env] & 0xF3FF) | ((value & 0x03) << 10));
+            frame_log_event(buffers, env, hot, kEvCtrl, value);
         } else if (reg == 1) {
             if (hot != nullptr) {
                 hot->mask = value;
             } else {
                 buffers.ppu.mask[env] = value;
             }
+            frame_log_event(buffers, env, hot, kEvMask, value);
         } else if (reg == 3) {
             buffers.ppu.oam_addr[env] = value;
         } else if (reg == 4) {
             env_oam(buffers, env)[buffers.ppu.oam_addr[env]] = value;
             ++buffers.ppu.oam_addr[env];
         } else if (reg == 5) {
+            frame_log_event(buffers, env, hot, kEvScroll, value, buffers.ppu.w[env]);
             if (buffers.ppu.w[env] == 0) {
                 if (buffers.ppu.x != nullptr) {
                     buffers.ppu.x[env] = static_cast<std::uint8_t>(value & 0x07);
@@ -260,6 +332,7 @@ NESLE_CUDA_HD inline void batch_cpu_write(BatchBuffers& buffers,
                 buffers.ppu.w[env] = 0;
             }
         } else if (reg == 6) {
+            frame_log_event(buffers, env, hot, kEvAddr, value, buffers.ppu.w[env]);
             if (buffers.ppu.w[env] == 0) {
                 buffers.ppu.t[env] =
                     static_cast<std::uint16_t>((buffers.ppu.t[env] & 0x00FF) | ((value & 0x3F) << 8));
@@ -269,10 +342,18 @@ NESLE_CUDA_HD inline void batch_cpu_write(BatchBuffers& buffers,
                     static_cast<std::uint16_t>((buffers.ppu.t[env] & 0x7F00) | value);
                 buffers.ppu.v[env] = buffers.ppu.t[env];
                 buffers.ppu.w[env] = 0;
+                bus_ppu_address<Mode>(buffers, env, buffers.ppu.v[env], hot);
             }
         } else if (reg == 7) {
+            const auto ppu_address = static_cast<std::uint16_t>(buffers.ppu.v[env] & 0x3FFF);
             bus_ppu_memory_write<Mode>(buffers, env, buffers.ppu.v[env], value);
+            if (ppu_address >= 0x3F00) {
+                frame_log_event(buffers, env, hot, kEvPalette, value, bus_mirror_palette_address(ppu_address));
+            } else {
+                frame_log_event(buffers, env, hot, kEvDataWrite, 0);
+            }
             bus_increment_vram_address(buffers, env, hot);
+            bus_ppu_address<Mode>(buffers, env, static_cast<std::uint16_t>(buffers.ppu.v[env] & 0x3FFF), hot);
         }
         buffers.ppu.open_bus[env] = value;
         return;
@@ -285,12 +366,18 @@ NESLE_CUDA_HD inline void batch_cpu_write(BatchBuffers& buffers,
         write_controller_strobe(buffers, env, value);
         return;
     }
+    if (address == 0x4010 || address == 0x4013 || address == 0x4015) {
+        write_apu_register(buffers, env, address, value);
+        return;
+    }
     if (address >= 0x6000 && address < 0x8000) {
-        env_prg_ram(buffers, env)[address - 0x6000] = value;
+        if (mapper_prg_ram_enabled<Mode>(buffers, env)) {
+            env_prg_ram(buffers, env)[address - 0x6000] = value;
+        }
         return;
     }
     if (address >= 0x8000) {
-        write_mapper_register<Mode>(buffers, env, address, value);
+        bus_write_mapper<Mode>(buffers, env, address, value, hot);
     }
 }
 

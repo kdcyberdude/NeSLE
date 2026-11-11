@@ -2,6 +2,8 @@
 
 #include <cstdint>
 
+#include "nesle/cuda/batch_apu.cuh"
+#include "nesle/cuda/batch_frame.cuh"
 #include "nesle/cuda/mapper.cuh"
 #include "nesle/cuda/state.cuh"
 
@@ -140,6 +142,7 @@ NESLE_CUDA_HD inline void cold_reset_console_env(BatchBuffers& buffers, std::uin
     buffers.cpu.sp[env] = 0xFD;
     buffers.cpu.p[env] = 0x24;
     buffers.cpu.cycles[env] = 7;
+    reset_dmc_env(buffers, env, 7);
     buffers.cpu.nmi_pending[env] = 0;
     buffers.cpu.irq_pending[env] = 0;
     buffers.cpu.controller1_shift[env] = 0;
@@ -181,6 +184,9 @@ NESLE_CUDA_HD inline void cold_reset_console_env(BatchBuffers& buffers, std::uin
     buffers.ppu.read_buffer[env] = 0;
     buffers.ppu.scroll_x[env] = 0;
     buffers.ppu.scroll_y[env] = 0;
+    if (buffers.ppu.sprite0_dot != nullptr) {
+        buffers.ppu.sprite0_dot[env] = 0;
+    }
 
     // PPU memory.
     auto* nt = buffers.ppu.nametable_ram + static_cast<std::uint64_t>(env) * kNametableRamBytes;
@@ -189,6 +195,7 @@ NESLE_CUDA_HD inline void cold_reset_console_env(BatchBuffers& buffers, std::uin
     zero_bytes_fast(pal, static_cast<std::uint32_t>(kPaletteRamBytes));
     auto* oam = env_oam(buffers, env);
     zero_bytes_fast(oam, static_cast<std::uint32_t>(kOamBytes));
+    frame_log_reset(buffers, env);
 
     // Reward baselines.
     buffers.previous_mario_x[env] = 0;
@@ -216,6 +223,7 @@ NESLE_CUDA_HD inline void warm_reset_console_env(BatchBuffers& buffers,
     buffers.cpu.sp[env] = snap.sp[level];
     buffers.cpu.p[env] = snap.p[level];
     buffers.cpu.cycles[env] = snap.cycles[level];
+    reset_dmc_env(buffers, env, snap.cycles[level]);  // state files carry no APU
     buffers.cpu.nmi_pending[env] = 0;
     buffers.cpu.irq_pending[env] = 0;
     buffers.cpu.controller1_shift[env] = 0;
@@ -236,7 +244,19 @@ NESLE_CUDA_HD inline void warm_reset_console_env(BatchBuffers& buffers,
     // game wrote, not a bank number. CHR RAM boards also carry their 8 KB of
     // pattern tables, which are visible machine state: without them the first
     // frame after a restore draws whatever the previous episode left there.
-    if (snap.cart_latch != nullptr && buffers.mapper.prg_bank != nullptr) {
+    if (buffers.cart.bank_kind >= kBankingFirstPaged) {
+        // Paged boards: the board registers FCEUmm saved in its board chunks
+        // (fcs::board_registers), and the IRQ line the board was holding.
+        if (snap.mapper_regs != nullptr && buffers.mapper.regs != nullptr) {
+            paged::restore(buffers, env,
+                           snap.mapper_regs + static_cast<std::uint64_t>(level) * kMapperRegBytes);
+            if (snap.irq_line != nullptr) {
+                buffers.cpu.irq_pending[env] = snap.irq_line[level];
+            }
+        } else {
+            reset_mapper_state(buffers, env);
+        }
+    } else if (snap.cart_latch != nullptr && buffers.mapper.prg_bank != nullptr) {
         const std::uint8_t latch = snap.cart_latch[level];
         buffers.mapper.prg_bank[env] = static_cast<std::uint8_t>(
             (latch >> buffers.cart.prg_bank_shift) & buffers.cart.prg_bank_mask);
@@ -265,6 +285,9 @@ NESLE_CUDA_HD inline void warm_reset_console_env(BatchBuffers& buffers,
     buffers.ppu.read_buffer[env] = snap.ppu_read_buffer[level];
     buffers.ppu.scroll_x[env] = 0;
     buffers.ppu.scroll_y[env] = 0;
+    if (buffers.ppu.sprite0_dot != nullptr) {
+        buffers.ppu.sprite0_dot[env] = 0;
+    }
 
     auto* nt = buffers.ppu.nametable_ram + static_cast<std::uint64_t>(env) * kNametableRamBytes;
     copy_bytes_fast(nt, snap.nametable_ram + nt_base,
@@ -274,6 +297,7 @@ NESLE_CUDA_HD inline void warm_reset_console_env(BatchBuffers& buffers,
                     static_cast<std::uint32_t>(kPaletteRamBytes));
     auto* oam = env_oam(buffers, env);
     copy_bytes_fast(oam, snap.oam + oam_base, static_cast<std::uint32_t>(kOamBytes));
+    frame_log_reset(buffers, env);
 
     // Reward baselines - seed previous_x and previous_time from the snapshot's RAM so the
     // first step's reward calculation doesn't see a synthetic large delta from zero.

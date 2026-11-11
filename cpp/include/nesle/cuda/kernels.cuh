@@ -32,6 +32,8 @@ void launch_console_step_kernel(const BatchBuffers& buffers,
                                 ConsoleStepStats stats,
                                 cudaStream_t stream);
 void launch_render_kernel(const BatchBuffers& buffers, StepConfig config, cudaStream_t stream);
+// Every env presents its current state as a frame with no writes (frame_log_reset).
+void launch_seed_frame_log_kernel(const BatchBuffers& buffers, std::uint32_t num_envs, cudaStream_t stream);
 void launch_reset_envs_kernel(const BatchBuffers& buffers,
                               const std::uint8_t* device_mask,
                               std::uint32_t num_envs,

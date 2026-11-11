@@ -75,6 +75,14 @@ std::string to_string(std::uint16_t mapper) {
             return "BNROM";
         case 94:
             return "UN1ROM";
+        case 1:
+            return "MMC1";
+        case 3:
+            return "CNROM";
+        case 4:
+            return "MMC3";
+        case 9:
+            return "MMC2";
         default:
             return "mapper " + std::to_string(mapper);
     }
@@ -140,6 +148,32 @@ MapperLayout describe_mapper(const RomMetadata& metadata) noexcept {
                                page_count_is_power_of_two(metadata.prg_rom_size, 0x8000);
             break;
 
+        case 1:   // MMC1 (SxROM)
+        case 3:   // CNROM
+        case 4:   // MMC3 (TxROM)
+        case 9: { // MMC2 (PxROM)
+            // Paged boards: no window; the bus goes through per-env page tables.
+            layout.bank_kind = metadata.mapper == 1   ? kBankKindMmc1
+                               : metadata.mapper == 3 ? kBankKindCnrom
+                               : metadata.mapper == 4 ? kBankKindMmc3
+                                                      : kBankKindMmc2;
+            layout.bus_conflicts = metadata.mapper == 3 && declared_conflicts;
+            const std::size_t chr_bytes =
+                metadata.chr_rom_size == 0 ? std::size_t{8 * 1024} : metadata.chr_rom_size;
+            const bool prg_ok = metadata.prg_rom_size >= (metadata.mapper == 3 ? 0x4000u : 0x8000u) &&
+                                metadata.prg_rom_size <= 512u * 1024u &&
+                                page_count_is_power_of_two(metadata.prg_rom_size, 0x2000);
+            const bool chr_ok = chr_bytes <= 256u * 1024u &&
+                                page_count_is_power_of_two(chr_bytes, 0x2000);
+            // CNROM and MMC2 have no CHR RAM variant that FCEUmm drives this way.
+            const bool chr_kind_ok =
+                metadata.chr_rom_size != 0 || metadata.mapper == 1 || metadata.mapper == 4;
+            layout.prg_page_mask = static_cast<std::uint16_t>(metadata.prg_rom_size / 0x2000 - 1);
+            layout.chr_page_mask = static_cast<std::uint16_t>(chr_bytes / 0x400 - 1);
+            layout.supported = prg_ok && chr_ok && chr_kind_ok;
+            break;
+        }
+
         default:
             break;
     }
@@ -159,7 +193,8 @@ std::string unsupported_mapper_reason(const RomMetadata& metadata) {
     }
     std::string reason = "unsupported mapper: " + to_string(metadata.mapper) + " (iNES " +
                          std::to_string(metadata.mapper) +
-                         "); NeSLE emulates NROM, UxROM, UN1ROM and BNROM (0, 2, 34, 94)";
+                         "); NeSLE emulates NROM, MMC1, UxROM, CNROM, MMC3, MMC2, BNROM and UN1ROM "
+                         "(0, 1, 2, 3, 4, 9, 34, 94)";
 
     if (metadata.prg_rom_size < 0x8000 || metadata.prg_rom_size % 0x2000 != 0) {
         reason += "; this image also has an unsupported PRG size (" +
