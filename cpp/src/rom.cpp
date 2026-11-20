@@ -270,10 +270,6 @@ std::uint32_t reset_vector_base(const MapperLayout& layout,
         // not of the image.
         return layout.window_bytes - 4u;
     }
-    if (layout.bank_kind == kBankKindMmc3 && real_prg_size > 0x80000u) {
-        // 1 MB Waixing MMC3 (245): PRG A19 starts low, so $E000 holds page $3F of the first 512 KB.
-        return 0x80000u - 4u;
-    }
     // NROM keeps the whole image at $8000 and UxROM keeps its fixed last 16 KB
     // at $C000, so on both $FFFC is the last four bytes of the image.
     return static_cast<std::uint32_t>(real_prg_size - 4u);

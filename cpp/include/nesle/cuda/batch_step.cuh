@@ -167,6 +167,14 @@ NESLE_CUDA_HD inline void cold_reset_console_env(BatchBuffers& buffers, std::uin
 
     // Mapper registers: power-on banks and header mirroring.
     reset_mapper_state(buffers, env);
+    if (buffers.cart.bank_kind >= kBankingFirstPaged && buffers.mapper.prg_page != nullptr &&
+        buffers.cart.prg_rom != nullptr) {
+        // Paged boards: $FFFC through the power-on page table (latch boards start in bank 0, Quattro in
+        // block 0, as FCEUmm's power handlers), not the end of the image.
+        const std::uint32_t base = buffers.mapper.prg_page[static_cast<std::uint64_t>(env) * kPrgPages + 3u] + 0x1FFCu;
+        buffers.cpu.pc[env] = static_cast<std::uint16_t>(
+            buffers.cart.prg_rom[base] | (static_cast<std::uint16_t>(buffers.cart.prg_rom[base + 1]) << 8));
+    }
 
     // PPU state.
     buffers.ppu.ctrl[env] = 0;
