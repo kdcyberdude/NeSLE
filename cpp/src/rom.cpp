@@ -293,8 +293,10 @@ MapperLayout describe_mapper(const RomMetadata& metadata) noexcept {
     }
     // FCEUmm SetupCartMirroring(4, 1, ExtraNTARAM): a four-screen header gets 2 KB more nametable RAM, here in
     // ext_ram (with its vblank snapshot). Only these carts get it; every other cart keeps its allocation.
+    // FFE boards (6, 17) are left folded: the reference fceumm core draws Uchuusen - Cosmo Carrier (four-screen
+    // header, mapper 6) as if nametables 2-3 mirror 0-1; the source does not show why.
     if (metadata.nametable_arrangement == NametableArrangement::FourScreen && layout.ext_ram_bytes == 0 &&
-        metadata.mapper != 5 && metadata.mapper != 74) {
+        metadata.mapper != 5 && metadata.mapper != 74 && layout.bank_kind != kBankKindFfe) {
         layout.ext_ram_bytes = 0x1000u;
     }
     return layout;
