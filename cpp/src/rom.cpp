@@ -164,6 +164,7 @@ MapperLayout describe_mapper(const RomMetadata& metadata) noexcept {
         case 118: // MMC3, nametables from CHR bit 7 (TxSROM)
         case 189: // MMC3, 32 KB PRG from $4120-$7FFF
         case 245: // Waixing MMC3 with CHR RAM
+        case 64:  // Tengen RAMBO-1
         case 9: { // MMC2 (PxROM)
             // Paged boards: no window; the bus goes through per-env page tables.
             layout.bank_kind = metadata.mapper == 1   ? kBankKindMmc1

@@ -111,6 +111,10 @@ constexpr std::uint32_t kMmc2Prg = 4, kMmc2Mirroring = 5, kMmc2Latch0 = 6, kMmc2
 constexpr std::uint32_t kMmc3BankSelect = 8, kMmc3Mirroring = 9, kMmc3PrgRam = 10,
                         kMmc3IrqLatch = 11, kMmc3IrqCounter = 12, kMmc3IrqEnabled = 13,
                         kMmc3IrqReload = 14, kMmc3Outer = 15;  // [15]: 189's 32 KB PRG register
+// RAMBO-1 (64): [16..26] R0-R9, RF  [27] command  [28] mirroring  [29] reload mode  [30] IRQ mode (1 = CPU cycles)
+//               [31] IRQ counter  [32] IRQ enabled  [33] IRQ latch  [34] cycle prescaler (0..3)
+constexpr std::uint32_t kRamboR = 16, kRamboCmd = 27, kRamboMirror = 28, kRamboRmode = 29, kRamboIrqMode = 30,
+                        kRamboCount = 31, kRamboIrqOn = 32, kRamboLatch = 33, kRamboPre = 34;
 
 NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE std::uint8_t* regs(const BatchBuffers& buffers,
                                                                  std::uint32_t env) {
@@ -245,6 +249,27 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void sync(const BatchBuffers& buff
             break;
         }
         case kBankingMmc3: {
+            if (buffers.cart.mapper == 64) {
+                const std::uint8_t* q = r + kRamboR;
+                if ((r[kRamboCmd] & 0x20u) != 0) {
+                    set_chr1(buffers, env, 0, q[0]);
+                    set_chr1(buffers, env, 1, q[8]);
+                    set_chr1(buffers, env, 2, q[1]);
+                    set_chr1(buffers, env, 3, q[9]);
+                } else {
+                    set_chr1(buffers, env, 0, q[0] & 0xFEu);
+                    set_chr1(buffers, env, 1, q[0] | 1u);
+                    set_chr1(buffers, env, 2, q[1] & 0xFEu);
+                    set_chr1(buffers, env, 3, q[1] | 1u);
+                }
+                for (std::uint32_t i = 0; i < 4u; ++i) set_chr1(buffers, env, 4u + i, q[2u + i]);
+                set_prg8(buffers, env, 0, q[6]);
+                set_prg8(buffers, env, 1, q[7]);
+                set_prg8(buffers, env, 2, q[10]);
+                set_prg8(buffers, env, 3, ~0u);
+                set_mirroring(buffers, env, r[kRamboMirror] != 0 ? kPageMapVertical : kPageMapHorizontal);
+                break;
+            }
             const std::uint32_t select = r[kMmc3BankSelect];
             // FCEUmm GENPWRAP keeps 7 bits; ~1 is the second-last page, ~0 the last.
             const std::uint32_t r6 = r[6] & 0x7Fu;
@@ -481,6 +506,11 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void power_on(const BatchBuffers& 
             r[kFmeMirror] = buffers.cart.nametable_arrangement == kNametableHorizontal ? 1u : 0u;
             break;
         case kBankingMmc3:
+            if (buffers.cart.mapper == 64) {  // RAMBO1Power: every bank register ~0, vertical mirroring
+                for (std::uint32_t i = 0; i < 11u; ++i) r[kRamboR + i] = 0xFF;
+                r[kRamboMirror] = 1;
+                break;
+            }
             r[1] = 2;
             r[2] = 4;
             r[3] = 5;
@@ -735,6 +765,39 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void write(BatchBuffers& buffers,
             }
             break;
         case kBankingMmc3:
+            if (buffers.cart.mapper == 64) {
+                switch (address & 0xF001u) {
+                    case 0x8000u: r[kRamboCmd] = value; return;
+                    case 0x8001u:
+                        if ((r[kRamboCmd] & 0x0Fu) < 10u) {
+                            r[kRamboR + (r[kRamboCmd] & 0x0Fu)] = value;
+                        } else if ((r[kRamboCmd] & 0x0Fu) == 0x0Fu) {
+                            r[kRamboR + 10u] = value;
+                        }
+                        break;
+                    case 0xA000u: r[kRamboMirror] = static_cast<std::uint8_t>((value & 1u) ^ 1u); break;
+                    case 0xC000u:
+                        r[kRamboLatch] = value;
+                        if (r[kRamboRmode] == 1u) r[kRamboCount] = value;
+                        return;
+                    case 0xC001u:
+                        r[kRamboRmode] = 1;
+                        r[kRamboCount] = r[kRamboLatch];
+                        r[kRamboIrqMode] = static_cast<std::uint8_t>(value & 1u);
+                        return;
+                    case 0xE000u:
+                        r[kRamboIrqOn] = 0;
+                        buffers.cpu.irq_pending[env] = 0;
+                        if (r[kRamboRmode] == 1u) r[kRamboCount] = r[kRamboLatch];
+                        return;
+                    case 0xE001u:
+                        r[kRamboIrqOn] = 1;
+                        if (r[kRamboRmode] == 1u) r[kRamboCount] = r[kRamboLatch];
+                        return;
+                    default: return;
+                }
+                break;
+            }
             switch (address & 0xE001u) {
                 case 0x8000u:
                     if (buffers.cart.mapper == 245 && ((value ^ r[kMmc3BankSelect]) & 0x80u) != 0) {
@@ -765,11 +828,31 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void write(BatchBuffers& buffers,
     sync(buffers, env);
 }
 
-// CPU cycles elapsed on a board with a cycle-driven IRQ (VRC4, FME-7).
+// RAMBO-1 (64) IRQ counter clock (FCEUmm: reload when 0, fire on reaching 0).
+NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void rambo_clock(BatchBuffers& buffers, std::uint32_t env) {
+    std::uint8_t* r = regs(buffers, env);
+    if (r[kRamboCount] == 0) {
+        r[kRamboCount] = r[kRamboLatch];
+    } else {
+        --r[kRamboCount];
+    }
+    if (r[kRamboCount] == 0 && r[kRamboIrqOn] != 0) {
+        buffers.cpu.irq_pending[env] = 1;
+    }
+}
+
+// CPU cycles elapsed on a board with a cycle-driven IRQ (VRC4, FME-7, RAMBO-1 cycle mode).
 NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void cpu_cycles(BatchBuffers& buffers, std::uint32_t env,
                                                               std::uint32_t cycles) {
     std::uint8_t* r = regs(buffers, env);
     const std::uint8_t kind = buffers.cart.bank_kind;
+    if (kind == kBankingMmc3) {
+        if (buffers.cart.mapper != 64 || r[kRamboIrqMode] == 0) return;
+        std::uint32_t pre = r[kRamboPre] + cycles;  // RAMBO1IRQHook: one clock per 4 CPU cycles
+        for (; pre >= 4u; pre -= 4u) rambo_clock(buffers, env);
+        r[kRamboPre] = static_cast<std::uint8_t>(pre);
+        return;
+    }
     if (kind_is_vrc(kind)) {
         if ((r[kVrcIrqControl] & 2u) == 0) return;
         auto clock = [&]() {
@@ -829,9 +912,16 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE bool read_6000_rom(const BatchBuff
     return true;
 }
 
-// MMC3 scanline counter clock (FCEUmm ClockMMC3Counter, revision B).
+// MMC3 scanline counter clock (FCEUmm ClockMMC3Counter, revision B). RAMBO-1 (64): RAMBO1HBHook.
 NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void mmc3_clock(BatchBuffers& buffers, std::uint32_t env) {
     std::uint8_t* r = regs(buffers, env);
+    if (buffers.cart.mapper == 64) {
+        if (r[kRamboIrqMode] == 0) {
+            r[kRamboRmode] = 0;
+            rambo_clock(buffers, env);
+        }
+        return;
+    }
     if (r[kMmc3IrqCounter] == 0 || r[kMmc3IrqReload] != 0) {
         r[kMmc3IrqCounter] = r[kMmc3IrqLatch];
         r[kMmc3IrqReload] = 0;
@@ -913,7 +1003,8 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void mapper_cpu_cycles(BatchBuffer
                                                                      std::uint32_t cycles) {
     if constexpr (Mode == kBankModePaged || Mode == kBankModeRuntime) {
         const std::uint8_t kind = buffers.cart.bank_kind;
-        if ((paged::kind_is_vrc(kind) || kind == kBankingFme7 || kind == kBankingSmb2j40) &&
+        if ((paged::kind_is_vrc(kind) || kind == kBankingFme7 || kind == kBankingSmb2j40 ||
+             (kind == kBankingMmc3 && buffers.cart.mapper == 64)) &&
             buffers.mapper.regs != nullptr) {
             paged::cpu_cycles(buffers, env, cycles);
         }
