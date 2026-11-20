@@ -102,6 +102,9 @@ constexpr std::uint8_t kPageMapSingleHigh = 0x0F;  // 1 1 1 1
 // Paged boards (see MapperStateSoA): per-env page tables and board registers.
 constexpr int kPrgPages = 4;          // 8 KB CPU pages at $8000, $A000, $C000, $E000
 constexpr int kChrPages = 8;          // 1 KB PPU pages at $0000-$1FFF
+// A chr_page entry with this bit maps the 1 KB page to CHR RAM on a CHR ROM board (TQROM, 119). The board has no
+// PRG RAM, so its 8 KB of CHR RAM lives in the env's prg_ram buffer; the offset's low 13 bits index it.
+constexpr std::uint32_t kChrPageRam = 0x80000000u;
 constexpr int kMapperRegBytes = 48;   // board registers, layout per board in mapper.cuh
 
 // How the $8000-$FFFF window is split. Resolved once on the host from the iNES
@@ -150,6 +153,21 @@ enum BankKind : std::uint8_t {
     kBankingNamco88,      // 88: Namco 108 with CHR A16 forced high for $1000-$1FFF
     kBankingM91,          // 91: pirate fighters: registers at $6000-$7FFF, 2 KB CHR, 8-scanline IRQ
     kBankingM42,          // 42: FDS conversions: ROM bank at $6000, last 32 KB fixed, 8 KB CHR, CPU-cycle IRQ
+    kBankingM228,         // 228: Action 52 / Cheetahmen II: address and data latched on $8000-$FFFF, 4 nibbles at $5000
+    kBankingM83,           // 83: Cony/Yoko fighters (FCEUmm yoko.c M83): 8/16 KB PRG, 1/2 KB CHR, 8 KB RAM, CPU-cycle IRQ
+    kBankingJy90,          // 90: JY Company (FCEUmm 90.c): 8 PRG / 4 CHR modes, ALU at $5800, prescaled IRQ
+    kBankingVrc1,          // 75: Konami VRC1: three 8 KB PRG, two 4 KB CHR with a high bit in the mode register
+    kBankingM246,          // 246: Fong Shen Bang: registers at $6000-$67FF, 2 KB RAM at $6800, 8 KB PRG / 2 KB CHR
+    kBankingSa72008,       // 133: Sachen SA72008: register at $4100-$5FFF (A & $100): PRG 32 KB bit 2, CHR 8 KB bits 0-1
+    kBankingM243,          // 243: Sachen S74LS374NA: command/data at $4100/$4101: 32 KB PRG, 8 KB CHR, mirroring
+    kBankingM188,          // 188: Bandai Karaoke Studio: 16 KB PRG at $8000, last fixed; $6000 reads 3; CHR RAM
+    kBankingVrc3,          // 73: Konami VRC3: 16 KB PRG at $8000, 16- or 8-bit CPU-cycle IRQ
+    kBankingM227,          // 227: FC12002R multicart: address latch picks 16/32 KB PRG and mirroring
+    kBankingM8,            // 8: FFE F3xxx: latch at $8000-$FFFF: 16 KB PRG (bits 3+), second 16 KB bank 1, 8 KB CHR (bits 0-1)
+    kBankingCprom,         // 13: CPROM: 16 KB CHR RAM, upper 4 KB switchable; the second 8 KB lives in prg_ram (kChrPageRam)
+    kBankingTaito48,       // 48: Taito TC0690: 8 KB PRG x2, 2 KB + 1 KB CHR, $E000 mirroring, scanline IRQ counting up to $100
+    kBankingJaleco18,      // 18: Jaleco SS88006: nibble-wide 8 KB PRG / 1 KB CHR registers, 16-bit CPU-cycle IRQ
+    kBankingM117,          // 117: Future Media: 8 KB PRG x4, 1 KB CHR x8, scanline IRQ
     kBankingFirstPaged = kBankingCnrom,
 };
 

@@ -119,7 +119,8 @@ NESLE_CUDA_HD inline void bus_write_mapper(BatchBuffers& buffers,
             const std::uint32_t creg = r[0] | (r[1] << 8) | (r[2] << 16) | (static_cast<std::uint32_t>(r[3]) << 24);
             write_mapper_register<Mode>(buffers, env, address, value);
             for (std::uint32_t i = 0; i < 8u; ++i) {
-                if (pages[i] != before[i]) frame_log_event(buffers, env, hot, kEvChr, pages[i] >> 10, i);
+                if (pages[i] != before[i]) frame_log_event(buffers, env, hot, kEvChr, (pages[i] >> 10) & 0xFFu,
+                                                                i | (((pages[i] >> 18) & 3u) << 3) | ((pages[i] >> 31) << 5));
             }
             if (buffers.mapper.mirroring[env] != mirroring) {
                 frame_log_event(buffers, env, hot, kEvMirror, buffers.mapper.mirroring[env]);
@@ -270,6 +271,12 @@ NESLE_CUDA_HD inline std::uint8_t batch_cpu_read(BatchBuffers& buffers,
     if (address >= 0x8000) {
         return read_prg<Mode>(buffers, env, address);
     }
+    if constexpr (Mode == kBankModePaged || Mode == kBankModeRuntime) {
+        std::uint8_t value;
+        if (address >= 0x4020 && buffers.mapper.regs != nullptr && paged::read_expansion(buffers, env, address, value)) {
+            return value;
+        }
+    }
     return 0;
 }
 
@@ -381,7 +388,8 @@ NESLE_CUDA_HD inline void batch_cpu_write(BatchBuffers& buffers,
             env_prg_ram(buffers, env)[address - 0x6000] = value;
         }
         if constexpr (Mode == kBankModePaged || Mode == kBankModeRuntime) {
-            if (buffers.cart.bank_kind > kBankingMmc3 || buffers.cart.mapper == 189) {  // boards with a register in $6000-$7FFF
+            if (buffers.cart.bank_kind > kBankingMmc3 || buffers.cart.mapper == 189 || buffers.cart.mapper == 187 ||
+                buffers.cart.mapper == 182 || buffers.cart.mapper == 114 || buffers.cart.mapper == 47) {  // boards with a register in $6000-$7FFF
                 bus_write_mapper<Mode>(buffers, env, address, value, hot);
             }
         }
@@ -393,7 +401,8 @@ NESLE_CUDA_HD inline void batch_cpu_write(BatchBuffers& buffers,
     }
     if (address >= 0x4020) {
         if constexpr (Mode == kBankModePaged || Mode == kBankModeRuntime) {
-            if (buffers.cart.bank_kind > kBankingMmc3 || buffers.cart.mapper == 189) {  // expansion-area registers ($4100 NINA-03/06, $4120 189, ...)
+            if (buffers.cart.bank_kind > kBankingMmc3 || buffers.cart.mapper == 189 || buffers.cart.mapper == 187 ||
+                buffers.cart.mapper == 182 || buffers.cart.mapper == 114) {  // expansion-area registers ($4100 NINA-03/06, $4120 189, ...)
                 bus_write_mapper<Mode>(buffers, env, address, value, hot);
             }
         }

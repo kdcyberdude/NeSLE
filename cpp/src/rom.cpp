@@ -165,11 +165,17 @@ MapperLayout describe_mapper(const RomMetadata& metadata) noexcept {
         case 189: // MMC3, 32 KB PRG from $4120-$7FFF
         case 245: // Waixing MMC3 with CHR RAM
         case 64:  // Tengen RAMBO-1
-        case 9: { // MMC2 (PxROM)
+        case 187: // MMC3 with a $5000/$6000 PRG override and CHR A18 on the 2 KB half
+        case 119: // TQROM: MMC3 with CHR ROM and 8 KB CHR RAM side by side
+        case 47:  // NES-QJ: MMC3 with a 128 KB block register at $6000
+        case 114: // MMC3 with scrambled registers and a 16 KB PRG override at $5000-$7FFF
+        case 182: // FCEUmm's database runs both 182 ROMs here as 114 (182 itself is deprecated there)
+        case 9:   // MMC2 (PxROM)
+        case 10: { // MMC4 (FxROM): MMC2's latches, 16 KB PRG
             // Paged boards: no window; the bus goes through per-env page tables.
             layout.bank_kind = metadata.mapper == 1   ? kBankKindMmc1
                                : metadata.mapper == 3 ? kBankKindCnrom
-                               : metadata.mapper == 9 ? kBankKindMmc2
+                               : metadata.mapper == 9 || metadata.mapper == 10 ? kBankKindMmc2
                                                       : kBankKindMmc3;
             layout.bus_conflicts = metadata.mapper == 3 && declared_conflicts;
             const std::size_t chr_bytes =
@@ -177,7 +183,7 @@ MapperLayout describe_mapper(const RomMetadata& metadata) noexcept {
             const bool prg_ok = metadata.prg_rom_size >= 0x4000u &&
                                 metadata.prg_rom_size <= (metadata.mapper == 245 ? 1024u : 512u) * 1024u &&
                                 page_count_is_power_of_two(metadata.prg_rom_size, 0x2000);
-            const bool chr_ok = chr_bytes <= 256u * 1024u &&
+            const bool chr_ok = chr_bytes <= (metadata.mapper == 187 || metadata.mapper == 10 ? 512u : 256u) * 1024u &&
                                 page_count_is_power_of_two(chr_bytes, 0x2000);
             // CNROM and MMC2 have no CHR RAM variant that FCEUmm drives this way.
             const bool chr_kind_ok =
@@ -188,7 +194,7 @@ MapperLayout describe_mapper(const RomMetadata& metadata) noexcept {
             break;
         }
 
-        case 15: case 32: case 88: case 91: case 42:
+        case 15: case 32: case 88: case 91: case 42: case 117: case 18: case 48: case 13: case 8: case 227: case 73: case 188: case 243: case 133: case 246: case 75: case 90: case 83: case 228:
         case 24: case 26: case 40: case 232:
         case 21: case 22: case 23: case 25: case 69:
         case 7: case 11: case 66: case 71: case 79: case 113: case 140: case 38: case 87: {
@@ -215,6 +221,21 @@ MapperLayout describe_mapper(const RomMetadata& metadata) noexcept {
                 case 88: layout.bank_kind = kBankKindNamco88; break;
                 case 91: layout.bank_kind = kBankKindM91; break;
                 case 42: layout.bank_kind = kBankKindM42; break;
+                case 117: layout.bank_kind = kBankKindM117; break;
+                case 18: layout.bank_kind = kBankKindJaleco18; break;
+                case 48: layout.bank_kind = kBankKindTaito48; break;
+                case 13: layout.bank_kind = kBankKindCprom; break;
+                case 8: layout.bank_kind = kBankKindM8; break;
+                case 227: layout.bank_kind = kBankKindM227; break;
+                case 73: layout.bank_kind = kBankKindVrc3; break;
+                case 188: layout.bank_kind = kBankKindM188; break;
+                case 243: layout.bank_kind = kBankKindM243; break;
+                case 133: layout.bank_kind = kBankKindSa72008; break;
+                case 246: layout.bank_kind = kBankKindM246; break;
+                case 75: layout.bank_kind = kBankKindVrc1; break;
+                case 90: layout.bank_kind = kBankKindJy90; break;
+                case 83: layout.bank_kind = kBankKindM83; break;
+                case 228: layout.bank_kind = kBankKindM228; break;
                 case 38: layout.bank_kind = kBankKindBitCorp38; break;
                 default: layout.bank_kind = kBankKindJaleco87; break;
             }
@@ -224,7 +245,7 @@ MapperLayout describe_mapper(const RomMetadata& metadata) noexcept {
             layout.chr_page_mask = static_cast<std::uint16_t>(chr_bytes / 0x400 - 1);
             layout.supported = metadata.prg_rom_size >= 0x4000 && metadata.prg_rom_size <= 512u * 1024u &&
                                page_count_is_power_of_two(metadata.prg_rom_size, 0x2000) &&
-                               chr_bytes <= 256u * 1024u && page_count_is_power_of_two(chr_bytes, 0x2000);
+                               chr_bytes <= 1024u * 1024u && page_count_is_power_of_two(chr_bytes, 0x2000);
             break;
         }
 

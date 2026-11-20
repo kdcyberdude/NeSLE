@@ -82,10 +82,11 @@ constexpr std::uint8_t kLogShortFrame = 4u;
 
 // Header words: 0 count (| kLogOverflow), 1 ctrl | mask << 8 | fine x << 16,
 // 2 v | t << 16, 3-4 CHR 1 KB page per slot, 5 mirroring page map | MMC2 latch 0 << 8 |
-// latch 1 << 16, 6 MMC2 CHR registers, 7-14 palette RAM, 15 the emphasis FCEUmm's
-// emphasis palette holds when the frame is shown (bits 0-2) | kLogKook.
+// latch 1 << 16 | slot i maps CHR RAM (kChrPageRam) << 24 + i, 6 MMC2 CHR registers, 7-14 palette RAM, 15 the emphasis FCEUmm's
+// emphasis palette holds when the frame is shown (bits 0-2) | kLogKook | CHR page bits 8-9
+// of slot i at bit 16 + 2i (boards with more than 256 KB of CHR).
 // Event: word 0 start dot (17 bits) | instruction cycles << 17 (4 bits) | kind << 24,
-// word 1 value | aux << 8.
+// word 1 value | aux << 8. kEvChr carries the page's bits 8-9 in aux bits 3-4.
 enum FrameLogEvent : std::uint8_t {
     kEvCtrl = 1,       // $2000
     kEvMask = 2,       // $2001
@@ -94,7 +95,7 @@ enum FrameLogEvent : std::uint8_t {
     kEvDataWrite = 5,  // $2007 write below the palette: address increment, aux = repeats
     kEvDataRead = 6,   // $2007 read (address increment)
     kEvPalette = 7,    // $2007 palette write: value, aux = palette index; address increment
-    kEvChr = 8,        // aux = CHR slot, value = 1 KB page
+    kEvChr = 8,        // aux = CHR slot | page bits 8-9 << 3 | CHR RAM << 5, value = 1 KB page bits 0-7
     kEvMirror = 9,     // value = nametable page map
     kEvMmc2 = 10,      // aux = MMC2 register (0-3 CHR, 6-7 latches), value
 };
@@ -130,8 +131,10 @@ NESLE_CUDA_FRAME_HD inline void frame_log_fill_header(const BatchBuffers& b,
         const std::uint32_t* pages = b.mapper.chr_page + static_cast<std::uint64_t>(env) * kChrPages;
         for (std::uint32_t i = 0; i < 8u; ++i) {
             h[3 + (i >> 2)] |= ((pages[i] >> 10) & 0xFFu) << ((i & 3u) * 8u);
+            h[15] |= ((pages[i] >> 18) & 3u) << (16u + 2u * i);
         }
         h[5] = b.mapper.mirroring[env];
+        for (std::uint32_t i = 0; i < 8u; ++i) h[5] |= (pages[i] >> 31) << (24u + i);
         if (b.cart.bank_kind == kBankingMmc2) {
             const std::uint8_t* r = paged::regs(b, env);
             h[5] |= (static_cast<std::uint32_t>(r[paged::kMmc2Latch0] & 1u) << 8) |
@@ -159,7 +162,7 @@ NESLE_CUDA_FRAME_HD NESLE_CUDA_FRAME_COLD std::uint8_t frame_log_capture(const B
     std::uint32_t* h = frame_log_bank(b, env, (log_bank & 1u) ^ 1u);
     frame_log_fill_header(b, env, ctrl, mask, h);
     const bool kook = (log_bank & kLogNextKook) != 0;
-    if (kook) h[15] = kLogKook;
+    if (kook) h[15] |= kLogKook;
     return static_cast<std::uint8_t>(((log_bank ^ kLogNextKook) & ~kLogShortFrame) | (kook ? kLogShortFrame : 0u));
 }
 
@@ -383,7 +386,7 @@ struct ReplayState {
     std::uint8_t ctrl;
     std::uint8_t mask;
     std::uint8_t mirroring;  // paged boards
-    std::uint8_t chr[8];     // paged boards: 1 KB page per slot
+    std::uint16_t chr[8];    // paged boards: 1 KB page per slot
     std::uint8_t creg[4];    // MMC2
     std::uint8_t latch[2];   // MMC2
     std::uint8_t pal[32];
@@ -429,7 +432,10 @@ NESLE_CUDA_FRAME_HD NESLE_CUDA_FRAME_INLINE void replay_load_header(ReplayState&
     s.x = static_cast<std::uint8_t>((h[1] >> 16) & 7u);
     s.v = static_cast<std::uint16_t>(h[2] & 0x7FFFu);
     s.t = static_cast<std::uint16_t>((h[2] >> 16) & 0x7FFFu);
-    for (int i = 0; i < 8; ++i) s.chr[i] = static_cast<std::uint8_t>(h[3 + (i >> 2)] >> ((i & 3) * 8));
+    for (int i = 0; i < 8; ++i) {
+        s.chr[i] = static_cast<std::uint16_t>(((h[3 + (i >> 2)] >> ((i & 3) * 8)) & 0xFFu) |
+                                              (((h[15] >> (16 + 2 * i)) & 3u) << 8) | (((h[5] >> (24 + i)) & 1u) << 15));
+    }
     s.mirroring = static_cast<std::uint8_t>(h[5]);
     s.latch[0] = static_cast<std::uint8_t>((h[5] >> 8) & 1u);
     s.latch[1] = static_cast<std::uint8_t>((h[5] >> 16) & 1u);
@@ -455,9 +461,11 @@ NESLE_CUDA_FRAME_HD NESLE_CUDA_FRAME_INLINE std::uint8_t replay_chr(const Replay
     const BatchBuffers& b = *src.b;
     address &= 0x1FFFu;
     if (b.cart.bank_kind >= kBankingFirstPaged) {
-        const std::uint32_t offset =
-            ((static_cast<std::uint32_t>(s.chr[address >> 10]) & b.cart.chr_page_mask) << 10) |
-            (address & 0x3FFu);
+        const std::uint32_t page = s.chr[address >> 10];
+        const std::uint32_t offset = ((page & b.cart.chr_page_mask) << 10) | (address & 0x3FFu);
+        if ((page & 0x8000u) != 0) {  // TQROM CHR RAM (kChrPageRam), kept in prg_ram
+            return b.cpu.prg_ram[static_cast<std::uint64_t>(src.env) * kPrgRamBytes + (((page & 7u) << 10) | (address & 0x3FFu))];
+        }
         if (b.cart.chr_rom != nullptr) return b.cart.chr_rom[offset];
         return b.ppu.chr_ram[static_cast<std::uint64_t>(src.env) * kChrRamBytes + (offset & 0x1FFFu)];
     }
@@ -485,7 +493,7 @@ NESLE_CUDA_FRAME_HD NESLE_CUDA_FRAME_INLINE std::uint8_t replay_nt(const ReplayS
 
 NESLE_CUDA_FRAME_HD NESLE_CUDA_FRAME_INLINE void replay_mmc2_select(ReplayState& s, std::uint32_t half) {
     const std::uint32_t bank = s.creg[2u * half + s.latch[half]];
-    for (std::uint32_t i = 0; i < 4u; ++i) s.chr[4u * half + i] = static_cast<std::uint8_t>(bank * 4u + i);
+    for (std::uint32_t i = 0; i < 4u; ++i) s.chr[4u * half + i] = static_cast<std::uint16_t>(bank * 4u + i);
 }
 
 // FCEUmm's MMC2 PPU_hook: a fetch from $0FD0-$0FEF / $1FD0-$1FEF flips a latch.
@@ -564,7 +572,7 @@ NESLE_CUDA_FRAME_HD inline void replay_apply(const ReplaySource& src, ReplayStat
             s.v = static_cast<std::uint16_t>((s.v + ((s.ctrl & 4u) != 0 ? 32u : 1u)) & 0x7FFFu);
             break;
         case kEvChr:
-            s.chr[aux & 7u] = static_cast<std::uint8_t>(value);
+            s.chr[aux & 7u] = static_cast<std::uint16_t>(value | (((aux >> 3) & 3u) << 8) | (((aux >> 5) & 1u) << 15));
             break;
         case kEvMirror:
             s.mirroring = static_cast<std::uint8_t>(value);

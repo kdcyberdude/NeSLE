@@ -199,25 +199,36 @@ constexpr std::uint32_t kMmc3PreRenderClockDot = 256;
 template <BankMode Mode>
 NESLE_CUDA_HD inline bool batch_ppu_has_scanline_counter(const BatchBuffers& buffers) {
     if constexpr (Mode == kBankModePaged || Mode == kBankModeRuntime) {
-        return (buffers.cart.bank_kind == kBankingMmc3 || buffers.cart.bank_kind == kBankingM91) &&
+        return (buffers.cart.bank_kind == kBankingMmc3 || buffers.cart.bank_kind == kBankingM91 ||
+                buffers.cart.bank_kind == kBankingJy90 || buffers.cart.bank_kind == kBankingTaito48 ||
+                buffers.cart.bank_kind == kBankingM117) &&
                buffers.mapper.regs != nullptr;
     } else {
         return false;
     }
 }
 
+// JY Company (90) clocks from GameHBIRQHook2: at the end of each visible line (after RefreshSprites,
+// 59 dots after the MMC3 hook) and next to the MMC3 hook on the pre-render line, with no pattern-table test.
+constexpr std::uint32_t kJyVisibleClockDot = 325;
+
+NESLE_CUDA_HD inline std::uint32_t batch_ppu_scanline_clock_dot(const BatchBuffers& buffers) {
+    return buffers.cart.bank_kind == kBankingJy90 ? kJyVisibleClockDot : kMmc3VisibleClockDot;
+}
+
 // Dots from frame position `current` to the next counter clock, strictly after it.
-NESLE_CUDA_HD inline std::uint32_t batch_ppu_dots_until_scanline_clock(std::uint32_t current) {
+NESLE_CUDA_HD inline std::uint32_t batch_ppu_dots_until_scanline_clock(std::uint32_t current,
+                                                                       std::uint32_t visible_dot = kMmc3VisibleClockDot) {
     constexpr std::uint32_t kDots = kPpuDotsPerScanline;
     constexpr std::uint32_t kPreRender = static_cast<std::uint32_t>(kPpuPreRenderScanline);
     const std::uint32_t line = current / kDots;
     const std::uint32_t dot = current % kDots;
     if (line < 240u) {
-        if (dot < kMmc3VisibleClockDot) {
-            return kMmc3VisibleClockDot - dot;
+        if (dot < visible_dot) {
+            return visible_dot - dot;
         }
         if (line + 1u < 240u) {
-            return kDots - dot + kMmc3VisibleClockDot;
+            return kDots - dot + visible_dot;
         }
         return (kPreRender - line) * kDots + kMmc3PreRenderClockDot - dot;
     }
@@ -227,7 +238,7 @@ NESLE_CUDA_HD inline std::uint32_t batch_ppu_dots_until_scanline_clock(std::uint
     if (dot < kMmc3PreRenderClockDot) {
         return kMmc3PreRenderClockDot - dot;
     }
-    return kDots - dot + kMmc3VisibleClockDot;  // line 0 of the next frame
+    return kDots - dot + visible_dot;  // line 0 of the next frame
 }
 
 // Clocks the counter for every clock dot in (start_dot, end_dot]. The span
@@ -237,16 +248,17 @@ NESLE_CUDA_HD inline void batch_ppu_clock_scanline_counter(BatchBuffers& buffers
                                                            std::uint32_t start_dot,
                                                            std::uint32_t end_dot,
                                                            const PpuHotState& hot) {
-    if ((hot.mask & 0x18) == 0 || (hot.ctrl & 0x38) == 0x18) {
+    if ((hot.mask & 0x18) == 0 || ((hot.ctrl & 0x38) == 0x18 && buffers.cart.bank_kind != kBankingJy90)) {
         return;
     }
+    const std::uint32_t visible_dot = batch_ppu_scanline_clock_dot(buffers);
     constexpr std::uint32_t kDots = kPpuDotsPerScanline;
     constexpr std::uint32_t kLines = kPpuScanlinesPerFrame;
     for (std::uint32_t line_abs = start_dot / kDots; line_abs <= end_dot / kDots; ++line_abs) {
         const std::uint32_t line = line_abs % kLines;
         std::uint32_t clock_dot;
         if (line < 240u) {
-            clock_dot = kMmc3VisibleClockDot;
+            clock_dot = visible_dot;
         } else if (line == static_cast<std::uint32_t>(kPpuPreRenderScanline)) {
             clock_dot = kMmc3PreRenderClockDot;
         } else {
@@ -387,7 +399,7 @@ NESLE_CUDA_HD inline std::uint32_t batch_ppu_cycles_until_next_event_hot(const B
             next = d < next ? d : next;
         }
         if (batch_ppu_has_scanline_counter<Mode>(buffers)) {
-            auto clock = batch_ppu_dots_until_scanline_clock(hot.frame_dot);
+            auto clock = batch_ppu_dots_until_scanline_clock(hot.frame_dot, batch_ppu_scanline_clock_dot(buffers));
             if (current + clock >= kFrameDots) {
                 clock -= skip;
             }
@@ -410,7 +422,7 @@ NESLE_CUDA_HD inline std::uint32_t batch_ppu_cycles_until_next_event_hot(const B
         }
     }
     if (batch_ppu_has_scanline_counter<Mode>(buffers)) {
-        const auto clock = batch_ppu_dots_until_scanline_clock(hot.frame_dot);
+        const auto clock = batch_ppu_dots_until_scanline_clock(hot.frame_dot, batch_ppu_scanline_clock_dot(buffers));
         if (clock < next) {
             next = clock;
         }
