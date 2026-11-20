@@ -257,6 +257,13 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void sync(const BatchBuffers& buff
             }
             set_prg8(buffers, env, 1, r[7] & 0x7Fu);
             set_prg8(buffers, env, 3, 0x7Fu);
+            if (buffers.cart.mapper == 245) {  // M245PW: PRG A19 from bit 1 of the last CHR register written
+                const std::uint32_t hi = (r[kMmc3Outer] & 2u) << 5;
+                set_prg8(buffers, env, (select & 0x40u) != 0 ? 2u : 0u, (r[6] & 0x3Fu) | hi);
+                set_prg8(buffers, env, (select & 0x40u) != 0 ? 0u : 2u, 0x3Eu | hi);
+                set_prg8(buffers, env, 1, (r[7] & 0x3Fu) | hi);
+                set_prg8(buffers, env, 3, 0x3Fu | hi);
+            }
             if (buffers.cart.mapper == 189) set_prg32(buffers, env, r[kMmc3Outer] & 7u);  // M189PW: 32 KB from $4120
             // CHR: 2 KB banks R0/R1 and 1 KB banks R2-R5; bit 7 swaps the halves.
             const std::uint32_t flip = (select & 0x80u) != 0 ? 4u : 0u;
@@ -729,8 +736,16 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void write(BatchBuffers& buffers,
             break;
         case kBankingMmc3:
             switch (address & 0xE001u) {
-                case 0x8000u: r[kMmc3BankSelect] = value; break;
-                case 0x8001u: r[r[kMmc3BankSelect] & 7u] = value; break;
+                case 0x8000u:
+                    if (buffers.cart.mapper == 245 && ((value ^ r[kMmc3BankSelect]) & 0x80u) != 0) {
+                        r[kMmc3Outer] = r[5];  // FixMMC3CHR rewrites every CHR bank, R5 last
+                    }
+                    r[kMmc3BankSelect] = value;
+                    break;
+                case 0x8001u:
+                    r[r[kMmc3BankSelect] & 7u] = value;
+                    if (buffers.cart.mapper == 245 && (r[kMmc3BankSelect] & 7u) < 6u) r[kMmc3Outer] = value;
+                    break;
                 case 0xA000u: r[kMmc3Mirroring] = value; break;
                 case 0xA001u: r[kMmc3PrgRam] = value; return;  // FCEUmm ignores PRG RAM protect on mapper 4
                 case 0xC000u: r[kMmc3IrqLatch] = value; return;
