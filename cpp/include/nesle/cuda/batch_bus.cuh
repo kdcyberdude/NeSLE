@@ -65,10 +65,16 @@ NESLE_CUDA_HD inline std::uint8_t bus_ppu_memory_read(BatchBuffers& buffers,
             if (cart_is_paged<Mode>(buffers.cart) && (buffers.mapper.mirroring[env] & kPageMapNtChr) != 0) {
                 const std::uint32_t q = (address >> 10) & 3u;
                 if (((buffers.mapper.mirroring[env] >> (4u + q)) & 1u) != 0) {
-                    const std::uint32_t page = paged::regs(buffers, env)[kNtChrPage + q];
+                    const std::uint8_t* r = paged::regs(buffers, env);
+                    const std::uint32_t page = r[kNtChrPage + q] |
+                        (buffers.cart.bank_kind == kBankingJy90 ? ((r[paged::kJyNtHi] >> q) & 1u) << 8 : 0u);
                     return buffers.cart.chr_rom[((page << 10) | (address & 0x3FFu)) % buffers.cart.chr_rom_size];
                 }
             }
+        }
+        if ((address & 0x800u) != 0 && four_screen_ram(buffers)) {  // nametables 2-3
+            return buffers.mapper.ext_ram[static_cast<std::uint64_t>(env) * buffers.cart.ext_ram_bytes + kFourScreenLive +
+                                          (address & 0x7FFu)];
         }
         return buffers.ppu.nametable_ram[static_cast<std::uint64_t>(env) * kNametableRamBytes +
                                         env_mirror_nametable_address<Mode>(buffers, env, address)];
@@ -105,6 +111,11 @@ NESLE_CUDA_HD inline void bus_ppu_memory_write(BatchBuffers& buffers,
                 ((buffers.mapper.mirroring[env] >> (4u + ((address >> 10) & 3u))) & 1u) != 0) {
                 return;  // a CHR ROM nametable
             }
+        }
+        if ((address & 0x800u) != 0 && four_screen_ram(buffers)) {  // nametables 2-3
+            buffers.mapper.ext_ram[static_cast<std::uint64_t>(env) * buffers.cart.ext_ram_bytes + kFourScreenLive +
+                                   (address & 0x7FFu)] = value;
+            return;
         }
         buffers.ppu.nametable_ram[static_cast<std::uint64_t>(env) * kNametableRamBytes +
                                   env_mirror_nametable_address<Mode>(buffers, env, address)] = value;
@@ -159,6 +170,7 @@ NESLE_CUDA_HD inline void bus_write_mapper(BatchBuffers& buffers,
             const std::uint32_t creg = r[0] | (r[1] << 8) | (r[2] << 16) | (static_cast<std::uint32_t>(r[3]) << 24);
             std::uint8_t nt_before[4];
             for (std::uint32_t q = 0; q < 4u; ++q) nt_before[q] = r[kNtChrPage + q];
+            const std::uint8_t nt_hi = buffers.cart.bank_kind == kBankingJy90 ? r[paged::kJyNtHi] : 0;
             std::uint8_t m5_before[24] = {};  // MMC5: CHR banks A/B (low, high) and vsize
             if (buffers.cart.bank_kind == kBankingMmc5) {
                 for (std::uint32_t i = 0; i < 24u; ++i) m5_before[i] = r[paged::kM5ALo + i];
@@ -179,7 +191,10 @@ NESLE_CUDA_HD inline void bus_write_mapper(BatchBuffers& buffers,
                 }
             } else {
                 for (std::uint32_t q = 0; q < 4u; ++q) {
-                    if (r[kNtChrPage + q] != nt_before[q]) frame_log_event(buffers, env, hot, kEvNtChr, r[kNtChrPage + q], q);
+                    const std::uint32_t hi = buffers.cart.bank_kind == kBankingJy90 ? (r[paged::kJyNtHi] >> q) & 1u : 0u;
+                    if (r[kNtChrPage + q] != nt_before[q] || hi != ((nt_hi >> q) & 1u)) {
+                        frame_log_event(buffers, env, hot, kEvNtChr, r[kNtChrPage + q], q | (hi << 2));
+                    }
                 }
             }
             if (buffers.cart.bank_kind == kBankingMmc5) {  // kEvMmc5: aux = bank 0-7 A, 8-11 B, 12 vsize | bits 8-9 << 4
@@ -467,7 +482,7 @@ NESLE_CUDA_HD inline void batch_cpu_write(BatchBuffers& buffers,
     if (address >= 0x4020) {
         if constexpr (Mode == kBankModePaged || Mode == kBankModeRuntime) {
             if (buffers.cart.bank_kind > kBankingMmc3 || buffers.cart.mapper == 189 || buffers.cart.mapper == 187 ||
-                buffers.cart.mapper == 182 || buffers.cart.mapper == 114) {  // expansion-area registers ($4100 NINA-03/06, $4120 189, ...)
+                buffers.cart.mapper == 182 || buffers.cart.mapper == 114 || buffers.cart.mapper == 121) {  // expansion-area registers ($4100 NINA-03/06, $4120 189, ...)
                 bus_write_mapper<Mode>(buffers, env, address, value, hot);
             }
         }

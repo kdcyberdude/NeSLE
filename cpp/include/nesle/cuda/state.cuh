@@ -112,6 +112,8 @@ constexpr std::uint32_t kNtChrPage = 44;  // 4 board registers, one per quadrant
 // prg_page flags (MMC5): the page is WRAM (offset into ext_ram), or nothing (open bus).
 constexpr std::uint32_t kPrgPageRam = 0x80000000u;
 constexpr std::uint32_t kPrgPageOpen = 0x40000000u;
+// Four-screen carts (any board but MMC5 / 74): ext_ram holds nametables 2-3 live, then their vblank snapshot.
+constexpr std::uint32_t kFourScreenLive = 0x000u, kFourScreenSnap = 0x800u;
 constexpr std::uint32_t kMmc5ExRam = 0x000u, kMmc5ExSnap = 0x400u, kMmc5ExHeader = 0x800u, kMmc5ExWram = 0x1000u;
 constexpr int kMapperRegBytes = 48;   // board registers, layout per board in mapper.cuh
 

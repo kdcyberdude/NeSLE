@@ -114,6 +114,21 @@ constexpr std::uint32_t kMmc3BankSelect = 8, kMmc3Mirroring = 9, kMmc3PrgRam = 1
 constexpr std::uint32_t kM187Unlock = 16;  // 187: $8001 ignored until $8000 is written
 // 114 (and 182, which FCEUmm's database runs as 114): [15] $5000-$7FFF register, [16] data write armed by $A000
 constexpr std::uint32_t kM114Armed = 16;
+// 121 (FCEUmm 121.c): [16..23] EXPREGS[0..7]
+constexpr std::uint32_t kM121Ex = 16;
+// 121's protection latch (FCEUmm 121.c Sync).
+NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void m121_sync(std::uint8_t* ex) {
+    switch (ex[5] & 0x3Fu) {
+        case 0x20: case 0x29: case 0x2B: case 0x3C: case 0x3F: ex[7] = 1; ex[0] = ex[6]; break;
+        case 0x26: ex[7] = 0; ex[0] = ex[6]; break;
+        case 0x2C: ex[7] = 1; if (ex[6] != 0) ex[0] = ex[6]; break;
+        case 0x28: ex[7] = 0; ex[1] = ex[6]; break;
+        case 0x2A: ex[7] = 0; ex[2] = ex[6]; break;
+        case 0x2F: break;
+        default: ex[5] = 0; break;
+    }
+}
+
 // RAMBO-1 (64): [16..26] R0-R9, RF  [27] command  [28] mirroring  [29] reload mode  [30] IRQ mode (1 = CPU cycles)
 //               [31] IRQ counter  [32] IRQ enabled  [33] IRQ latch  [34] cycle prescaler (0..3)
 constexpr std::uint32_t kRamboR = 16, kRamboCmd = 27, kRamboMirror = 28, kRamboRmode = 29, kRamboIrqMode = 30,
@@ -203,6 +218,9 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE std::uint8_t header_page_map(const
 //   [31] $5803 [32] $6000 ROM mapped [33] $6000 bank
 constexpr std::uint32_t kJyChrLo = 4, kJyChrHi = 12, kJyMode = 20, kJyIrqMode = 24, kJyPre = 25, kJyCount = 26,
                         kJyXor = 27, kJyIrqOn = 28, kJyMul = 29, kJyRegie = 31, kJy6000On = 32, kJy6000 = 33;
+// 209 nametable control: [34..37] $B000-$B003 (names low) [38..41] $B004-$B007 (names high)
+//   [42] bit q = bit 8 of quadrant q's CHR ROM nametable page (the low 8 bits are at kNtChrPage + q)
+constexpr std::uint32_t kJyNames = 34, kJyNamesHi = 38, kJyNtHi = 42;
 // 83 (FCEUmm yoko.c M83): [0..10] reg [11] mode [12] bank [13..16] $5100-$5103 [17] IRQ enabled
 //   [18,19] IRQ counter (little endian) [20] 2 KB CHR seen [21] 1 KB CHR seen
 constexpr std::uint32_t kM83Mode = 11, kM83Bank = 12, kM83Low = 13, kM83IrqOn = 17, kM83Count = 18, kM83Is2k = 20,
@@ -339,7 +357,7 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void sync(const BatchBuffers& buff
             break;
         }
         case kBankingMmc3: {
-            if (buffers.cart.mapper == 64) {
+            if (buffers.cart.mapper == 64 || buffers.cart.mapper == 158) {
                 const std::uint8_t* q = r + kRamboR;
                 if ((r[kRamboCmd] & 0x20u) != 0) {
                     set_chr1(buffers, env, 0, q[0]);
@@ -357,6 +375,16 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void sync(const BatchBuffers& buff
                 set_prg8(buffers, env, 1, q[7]);
                 set_prg8(buffers, env, 2, q[10]);
                 set_prg8(buffers, env, 3, ~0u);
+                if (buffers.cart.mapper == 158) {  // M158PPU: nametable q follows bit 7 of the bank in CHR slot q
+                    const std::uint32_t lo[4] = {(r[kRamboCmd] & 0x20u) != 0 ? q[0] : q[0] & 0xFEu,
+                                                 (r[kRamboCmd] & 0x20u) != 0 ? q[8] : q[0] | 1u,
+                                                 (r[kRamboCmd] & 0x20u) != 0 ? q[1] : q[1] & 0xFEu,
+                                                 (r[kRamboCmd] & 0x20u) != 0 ? q[9] : q[1] | 1u};
+                    std::uint8_t map = 0;
+                    for (std::uint32_t i = 0; i < 4u; ++i) map |= static_cast<std::uint8_t>(((lo[i] >> 7) & 1u) << i);
+                    set_mirroring(buffers, env, map);
+                    break;
+                }
                 set_mirroring(buffers, env, r[kRamboMirror] != 0 ? kPageMapVertical : kPageMapHorizontal);
                 break;
             }
@@ -399,7 +427,21 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void sync(const BatchBuffers& buff
             set_chr1(buffers, env, 5u ^ flip, r[3]);
             set_chr1(buffers, env, 6u ^ flip, r[4]);
             set_chr1(buffers, env, 7u ^ flip, r[5]);
-            if (buffers.cart.mapper == 187) {  // M187CW: the 2 KB half reads CHR A18 high
+            if (buffers.cart.mapper == 121) {  // M121PW / M121CW
+                const std::uint8_t* ex = r + kM121Ex;
+                const std::uint32_t hi = (ex[3] & 0x80u) >> 2;
+                set_prg8(buffers, env, 0, ((select & 0x40u) != 0 ? 0x1Eu : r[6] & 0x1Fu) | hi);
+                if ((ex[5] & 0x3Fu) != 0) {
+                    set_prg8(buffers, env, 1, ex[2] | hi);
+                    set_prg8(buffers, env, 2, ex[1] | hi);
+                    set_prg8(buffers, env, 3, ex[0] | hi);
+                } else {
+                    set_prg8(buffers, env, 1, (r[7] & 0x1Fu) | hi);
+                    set_prg8(buffers, env, 2, ((select & 0x40u) != 0 ? r[6] & 0x1Fu : 0x1Eu) | hi);
+                    set_prg8(buffers, env, 3, 0x1Fu | hi);
+                }
+            }
+            if (buffers.cart.mapper == 187 || buffers.cart.mapper == 121) {  // M187CW / M121CW: the 2 KB half reads CHR A18 high
                 set_chr1(buffers, env, 0u ^ flip, (r[0] & 0xFEu) | 0x100u);
                 set_chr1(buffers, env, 1u ^ flip, r[0] | 0x101u);
                 set_chr1(buffers, env, 2u ^ flip, (r[1] & 0xFEu) | 0x100u);
@@ -693,6 +735,19 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void sync(const BatchBuffers& buff
                     for (std::uint32_t i = 0; i < 8u; ++i) set_chr1(buffers, env, i, chr(i));
                     break;
             }
+            if (buffers.cart.mapper == 209 && (m0 & 0x20u) != 0) {  // mira: 209's nametable control
+                std::uint8_t map = 0;  // the CHR ROM pages are set by jy209_names
+                for (std::uint32_t q = 0; q < 4u; ++q) {
+                    const std::uint32_t name = r[kJyNames + q];
+                    if ((m0 & 0x40u) != 0 || (r[kJyMode + 1] & 0x80u) != (name & 0x80u)) {  // CHR ROM nametable
+                        map = static_cast<std::uint8_t>(map | (1u << (4u + q)));
+                    } else {
+                        map = static_cast<std::uint8_t>(map | ((name & 1u) << q));
+                    }
+                }
+                set_mirroring(buffers, env, map);
+                break;
+            }
             switch (r[kJyMode + 1] & 3u) {
                 case 0: set_mirroring(buffers, env, kPageMapVertical); break;
                 case 1: set_mirroring(buffers, env, kPageMapHorizontal); break;
@@ -718,6 +773,11 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void sync(const BatchBuffers& buff
             }
             break;
         case kBankingSa72008:  // [0] latch
+            if (buffers.cart.mapper == 149) {  // SA0036 (SA72007Synco): CHR from bit 7
+                set_prg32(buffers, env, 0);
+                set_chr8(buffers, env, r[0] >> 7);
+                break;
+            }
             set_prg32(buffers, env, (r[0] >> 2) & 1u);
             set_chr8(buffers, env, r[0] & 3u);
             break;
@@ -1007,11 +1067,12 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void power_on(const BatchBuffers& 
             r[kFmeMirror] = buffers.cart.nametable_arrangement == kNametableHorizontal ? 1u : 0u;
             break;
         case kBankingMmc3:
-            if (buffers.cart.mapper == 64) {  // RAMBO1Power: every bank register ~0, vertical mirroring
+            if (buffers.cart.mapper == 64 || buffers.cart.mapper == 158) {  // RAMBO1Power: every bank register ~0, vertical mirroring
                 for (std::uint32_t i = 0; i < 11u; ++i) r[kRamboR + i] = 0xFF;
                 r[kRamboMirror] = 1;
                 break;
             }
+            if (buffers.cart.mapper == 121) r[kM121Ex + 3] = 0x80;  // M121Power
             r[1] = 2;
             r[2] = 4;
             r[3] = 5;
@@ -1307,7 +1368,7 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void write(BatchBuffers& buffers,
             }
             return;
         } else if (kind == kBankingSa72008) {
-            if (address >= 0x6000u || (address & 0x0100u) == 0) return;
+            if (address >= 0x6000u || (address & 0x0100u) == 0 || buffers.cart.mapper == 149) return;
             r[0] = value;
             sync(buffers, env);
             return;
@@ -1373,6 +1434,15 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void write(BatchBuffers& buffers,
             if (address < 0x6000u) return;  // M47Write
             r[kMmc3Outer] = static_cast<std::uint8_t>(value & 1u);
             sync(buffers, env);
+            return;
+        } else if (kind == kBankingMmc3 && buffers.cart.mapper == 121) {
+            if (address < 0x5000u || address >= 0x6000u) return;
+            constexpr std::uint8_t kProt[4] = {0x83, 0x83, 0x42, 0x00};  // M121LoWrite
+            r[kM121Ex + 4] = kProt[value & 3u];
+            if ((address & 0x5180u) == 0x5180u) {
+                r[kM121Ex + 3] = value;
+                sync(buffers, env);
+            }
             return;
         } else if (kind == kBankingMmc3 && buffers.cart.mapper == 187) {
             if (address != 0x5000u && address != 0x6000u) return;  // M187WriteLo
@@ -1571,6 +1641,16 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void write(BatchBuffers& buffers,
                     if (address >= 0xD600u) return;
                     r[kJyMode + (address & 3u)] = value;
                     break;
+                case 0xB000u:  // M90NTWrite: nametable registers, used by 209 only
+                    if (buffers.cart.mapper != 209) return;
+                    r[((address & 4u) != 0 ? kJyNamesHi : kJyNames) + (address & 3u)] = value;
+                    for (std::uint32_t q = 0; q < 4u; ++q) {  // CHR ROM nametable pages: 9 bits, low 8 at kNtChrPage
+                        const std::uint32_t page = (r[kJyNames + q] | (static_cast<std::uint32_t>(r[kJyNamesHi + q]) << 8)) &
+                                                   buffers.cart.chr_page_mask;
+                        r[kNtChrPage + q] = static_cast<std::uint8_t>(page);
+                        r[kJyNtHi] = static_cast<std::uint8_t>((r[kJyNtHi] & ~(1u << q)) | (((page >> 8) & 1u) << q));
+                    }
+                    break;
                 default: return;  // $B000 nametable registers: no effect on 90; $E000-$FFFF dummy
             }
             if ((r[kJyMode] & 0x80u) != 0) {  // tekprom maps $6000 only while mode bit 7 is set; the mapping then stays
@@ -1597,7 +1677,11 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void write(BatchBuffers& buffers,
                 default: return;
             }
             break;
-        case kBankingM246: case kBankingSa72008: case kBankingM243:
+        case kBankingSa72008:
+            if (buffers.cart.mapper != 149) return;
+            r[0] = value;  // SADWrite: 149's latch is at $8000-$FFFF, no bus conflict
+            break;
+        case kBankingM246: case kBankingM243:
             return;
         case kBankingM188: case kBankingM8: case kBankingCprom: case kBankingFfe:
             r[0] = value;
@@ -1845,7 +1929,7 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void write(BatchBuffers& buffers,
             }
             break;
         case kBankingMmc3:
-            if (buffers.cart.mapper == 64) {
+            if (buffers.cart.mapper == 64 || buffers.cart.mapper == 158) {
                 switch (address & 0xF001u) {
                     case 0x8000u: r[kRamboCmd] = value; return;
                     case 0x8001u:
@@ -1897,6 +1981,23 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void write(BatchBuffers& buffers,
                     default: return;  // $8000
                 }
             }
+            if (buffers.cart.mapper == 121 && address < 0xA000u) {  // M121Write
+                std::uint8_t* ex = r + kM121Ex;
+                switch (address & 0xE003u) {
+                    case 0x8000u: break;
+                    case 0x8001u:
+                        ex[6] = static_cast<std::uint8_t>(((value & 1u) << 5) | ((value & 2u) << 3) | ((value & 4u) << 1) |
+                                                          ((value & 8u) >> 1) | ((value & 0x10u) >> 3) | ((value & 0x20u) >> 5));
+                        if (ex[7] == 0) m121_sync(ex);
+                        break;
+                    case 0x8003u:
+                        ex[5] = value;
+                        m121_sync(ex);
+                        address = 0x8000u;
+                        break;
+                    default: return;
+                }
+            }
             switch (address & 0xE001u) {
                 case 0x8000u:
                     if (buffers.cart.mapper == 187 && address == 0x8000u) r[kM187Unlock] = 1;  // M187Write8000
@@ -1929,15 +2030,14 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void write(BatchBuffers& buffers,
     sync(buffers, env);
 }
 
-// RAMBO-1 (64) IRQ counter clock (FCEUmm: reload when 0, fire on reaching 0).
-NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void rambo_clock(BatchBuffers& buffers, std::uint32_t env) {
+// RAMBO-1 (64) IRQ counter clock, as old FCEUmm's tengen.c (RAMBO1HBHook / RAMBO1IRQHook): the counter only
+// counts down; the IRQ fires when it wraps from 0 to $FF. A line clock also sets rmode (1 on firing, else 0).
+NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void rambo_clock(BatchBuffers& buffers, std::uint32_t env, bool line) {
     std::uint8_t* r = regs(buffers, env);
-    if (r[kRamboCount] == 0) {
-        r[kRamboCount] = r[kRamboLatch];
-    } else {
-        --r[kRamboCount];
-    }
-    if (r[kRamboCount] == 0 && r[kRamboIrqOn] != 0) {
+    if (line) r[kRamboRmode] = 0;
+    --r[kRamboCount];
+    if (r[kRamboCount] == 0xFFu && r[kRamboIrqOn] != 0) {
+        if (line) r[kRamboRmode] = 1;
         buffers.cpu.irq_pending[env] = 1;
     }
 }
@@ -2101,9 +2201,9 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void cpu_cycles(BatchBuffers& buff
         return;
     }
     if (kind == kBankingMmc3) {
-        if (buffers.cart.mapper != 64 || r[kRamboIrqMode] == 0) return;
+        if ((buffers.cart.mapper != 64 && buffers.cart.mapper != 158) || r[kRamboIrqMode] == 0) return;
         std::uint32_t pre = r[kRamboPre] + cycles;  // RAMBO1IRQHook: one clock per 4 CPU cycles
-        for (; pre >= 4u; pre -= 4u) rambo_clock(buffers, env);
+        for (; pre >= 4u; pre -= 4u) rambo_clock(buffers, env, false);
         r[kRamboPre] = static_cast<std::uint8_t>(pre);
         return;
     }
@@ -2200,6 +2300,10 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE bool read_6000_rom(const BatchBuff
 // $4020-$5FFF reads the board answers. Returns true and the byte when it does.
 NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE bool read_expansion(const BatchBuffers& buffers, std::uint32_t env,
                                                                   std::uint16_t address, std::uint8_t& out) {
+    if (buffers.cart.bank_kind == kBankingMmc3 && buffers.cart.mapper == 121 && address >= 0x5000u) {  // M121Read
+        out = regs(buffers, env)[kM121Ex + 4];
+        return true;
+    }
     if (buffers.cart.bank_kind == kBankingMmc5 && address >= 0x5000u) {  // MMC5_read, MMC5_ExRAMRd
         std::uint8_t* r = regs(buffers, env);
         if (address >= 0x5C00u) {
@@ -2295,11 +2399,8 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void mmc3_clock(BatchBuffers& buff
         if (r[6] != 0 && r[7] < 8u && ++r[7] >= 8u) buffers.cpu.irq_pending[env] = 1;
         return;
     }
-    if (buffers.cart.mapper == 64) {
-        if (r[kRamboIrqMode] == 0) {
-            r[kRamboRmode] = 0;
-            rambo_clock(buffers, env);
-        }
+    if (buffers.cart.mapper == 64 || buffers.cart.mapper == 158) {
+        if (r[kRamboIrqMode] == 0) rambo_clock(buffers, env, true);
         return;
     }
     const std::uint8_t before = r[kMmc3IrqCounter];
@@ -2399,7 +2500,7 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void mapper_cpu_cycles(BatchBuffer
         if ((paged::kind_is_vrc(kind) || kind == kBankingFme7 || kind == kBankingSmb2j40 ||
              kind == kBankingM42 || kind == kBankingM83 || kind == kBankingJy90 || kind == kBankingVrc3 ||
              kind == kBankingJaleco18 || kind == kBankingBandai16 || kind == kBankingFfe || kind == kBankingN163 || (kind == kBankingMmc1 && buffers.cart.mapper == 105) ||
-             (kind == kBankingMmc3 && buffers.cart.mapper == 64)) &&
+             (kind == kBankingMmc3 && (buffers.cart.mapper == 64 || buffers.cart.mapper == 158))) &&
             buffers.mapper.regs != nullptr) {
             paged::cpu_cycles(buffers, env, cycles);
         }
@@ -2600,6 +2701,12 @@ template <BankMode Mode = kBankModeRuntime>
 NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE std::uint8_t env_nametable_arrangement(
     const BatchBuffers& buffers, std::uint32_t) {
     return buffers.cart.nametable_arrangement;
+}
+
+// A four-screen cart whose nametables 2-3 live in ext_ram (kFourScreenLive); MMC5 and 74 use ext_ram otherwise.
+NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE bool four_screen_ram(const BatchBuffers& b) {
+    return b.cart.nametable_arrangement == kNametableFourScreen && b.mapper.ext_ram != nullptr &&
+           b.cart.bank_kind != kBankingMmc5 && b.cart.mapper != 74;
 }
 
 NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE std::uint16_t mirror_nametable_address(std::uint8_t arrangement,

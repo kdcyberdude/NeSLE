@@ -280,6 +280,8 @@ NESLE_CUDA_HD inline void batch_ppu_clock_scanline_counter(BatchBuffers& buffers
         if (line < 240u) {
             clock_dot = visible_dot;
         } else if (line == static_cast<std::uint32_t>(kPpuPreRenderScanline)) {
+            // RAMBO1HBHook skips the pre-render call: FCEUmm's scanline is still 240 there
+            if (buffers.cart.bank_kind == kBankingMmc3 && (buffers.cart.mapper == 64 || buffers.cart.mapper == 158)) continue;
             clock_dot = kMmc3PreRenderClockDot;
         } else {
             continue;
@@ -553,6 +555,10 @@ NESLE_CUDA_HD inline BatchPpuStepResult batch_ppu_step_env_hot(BatchBuffers& buf
                 auto* nt_dst =
                     buffers.ppu.snap_nametable + static_cast<std::uint64_t>(env) * kNametableRamBytes;
                 copy_bytes_fast(nt_dst, nt_src, static_cast<std::uint32_t>(kNametableRamBytes));
+                if (four_screen_ram(buffers)) {  // nametables 2-3 too
+                    std::uint8_t* x = buffers.mapper.ext_ram + static_cast<std::uint64_t>(env) * buffers.cart.ext_ram_bytes;
+                    copy_bytes_fast(x + kFourScreenSnap, x + kFourScreenLive, 0x800u);
+                }
                 if (buffers.cart.bank_kind == kBankingMmc5 && buffers.mapper.ext_ram != nullptr) {  // ExRAM too
                     std::uint8_t* x = paged::mmc5_ext(buffers, env);
                     copy_bytes_fast(x + kMmc5ExSnap, x + kMmc5ExRam, 0x400u);

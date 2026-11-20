@@ -190,6 +190,8 @@ MapperLayout describe_mapper(const RomMetadata& metadata) noexcept {
         case 189: // MMC3, 32 KB PRG from $4120-$7FFF
         case 245: // Waixing MMC3 with CHR RAM
         case 64:  // Tengen RAMBO-1
+        case 158: // RAMBO-1 with CHR bit 7 picking each nametable (old FCEUmm M158PPU)
+        case 121: // MMC3 with a $5000 protection latch and PRG override (old FCEUmm 121.c)
         case 187: // MMC3 with a $5000/$6000 PRG override and CHR A18 on the 2 KB half
         case 119: // TQROM: MMC3 with CHR ROM and 8 KB CHR RAM side by side
         case 74:  // MMC3 with 2 KB CHR RAM at banks 8-9 (ext_ram)
@@ -203,13 +205,16 @@ MapperLayout describe_mapper(const RomMetadata& metadata) noexcept {
                                : metadata.mapper == 3 ? kBankKindCnrom
                                : metadata.mapper == 9 || metadata.mapper == 10 ? kBankKindMmc2
                                                       : kBankKindMmc3;
-            layout.bus_conflicts = metadata.mapper == 3 && declared_conflicts;
+            // CNROM_Init (old FCEUmm): bus conflicts on, except five unlicensed carts listed by CRC.
+            layout.bus_conflicts = metadata.mapper == 3 && metadata.crc32 != 0xf283cf58u &&
+                                   metadata.crc32 != 0x2915faf0u && metadata.crc32 != 0xebd0644du &&
+                                   metadata.crc32 != 0x8f154a0du && metadata.crc32 != 0xd04a40e6u;
             const std::size_t chr_bytes =
                 metadata.chr_rom_size == 0 ? std::size_t{8 * 1024} : metadata.chr_rom_size;
             const bool prg_ok = metadata.prg_rom_size >= 0x4000u &&
                                 metadata.prg_rom_size <= (metadata.mapper == 245 ? 1024u : 512u) * 1024u &&
                                 page_count_is_power_of_two(metadata.prg_rom_size, 0x2000);
-            const bool chr_ok = chr_bytes <= (metadata.mapper == 187 || metadata.mapper == 10 ? 512u : 256u) * 1024u &&
+            const bool chr_ok = chr_bytes <= (metadata.mapper == 187 || metadata.mapper == 121 || metadata.mapper == 10 ? 512u : 256u) * 1024u &&
                                 page_count_is_power_of_two(chr_bytes, 0x2000);
             // CNROM and MMC2 have no CHR RAM variant that FCEUmm drives this way.
             const bool chr_kind_ok =
@@ -221,7 +226,7 @@ MapperLayout describe_mapper(const RomMetadata& metadata) noexcept {
             break;
         }
 
-        case 15: case 32: case 88: case 91: case 42: case 68: case 19: case 17: case 6: case 16: case 222: case 117: case 18: case 48: case 13: case 8: case 227: case 73: case 188: case 243: case 133: case 246: case 75: case 90: case 83: case 228:
+        case 15: case 32: case 88: case 91: case 42: case 68: case 19: case 17: case 6: case 16: case 222: case 117: case 18: case 48: case 13: case 8: case 227: case 73: case 188: case 243: case 133: case 149: case 246: case 75: case 90: case 209: case 83: case 228:
         case 24: case 26: case 40: case 232:
         case 21: case 22: case 23: case 25: case 69:
         case 7: case 11: case 66: case 71: case 79: case 113: case 140: case 38: case 87: {
@@ -262,10 +267,10 @@ MapperLayout describe_mapper(const RomMetadata& metadata) noexcept {
                 case 73: layout.bank_kind = kBankKindVrc3; break;
                 case 188: layout.bank_kind = kBankKindM188; break;
                 case 243: layout.bank_kind = kBankKindM243; break;
-                case 133: layout.bank_kind = kBankKindSa72008; break;
+                case 133: case 149: layout.bank_kind = kBankKindSa72008; break;
                 case 246: layout.bank_kind = kBankKindM246; break;
                 case 75: layout.bank_kind = kBankKindVrc1; break;
-                case 90: layout.bank_kind = kBankKindJy90; break;
+                case 90: case 209: layout.bank_kind = kBankKindJy90; break;
                 case 83: layout.bank_kind = kBankKindM83; break;
                 case 228: layout.bank_kind = kBankKindM228; break;
                 case 38: layout.bank_kind = kBankKindBitCorp38; break;
@@ -285,6 +290,12 @@ MapperLayout describe_mapper(const RomMetadata& metadata) noexcept {
 
         default:
             break;
+    }
+    // FCEUmm SetupCartMirroring(4, 1, ExtraNTARAM): a four-screen header gets 2 KB more nametable RAM, here in
+    // ext_ram (with its vblank snapshot). Only these carts get it; every other cart keeps its allocation.
+    if (metadata.nametable_arrangement == NametableArrangement::FourScreen && layout.ext_ram_bytes == 0 &&
+        metadata.mapper != 5 && metadata.mapper != 74) {
+        layout.ext_ram_bytes = 0x1000u;
     }
     return layout;
 }
@@ -452,6 +463,24 @@ RomImage parse_ines(std::span<const std::uint8_t> bytes) {
         }
         crc = ~crc;
         image.metadata.crc32 = crc;
+        // FCEUmm ines-correct.h entries with mirror 8: "anything but hard-wired four-screen"; a four-screen
+        // bit on these carts is cleared to horizontal (Mirroring = 0), so the board's own register rules.
+        static constexpr std::uint32_t kNotFourScreen[] = {
+            0xd8ee7669u, 0x5b837e8du, 0x37ba3261u, 0x5b6ca654u, 0x61a852eau, 0xf6fa4453u, 0x391aa1b8u, 0xa5e8d2cdu,
+            0x3f56a392u, 0x078ced30u, 0xfe364be5u, 0x57c12280u, 0xd09b74dcu, 0xe8baa782u, 0x970bd9c2u, 0xcd7a2fd7u,
+            0x63469396u, 0xe94d5181u, 0x7156cb4du, 0x70f67ab7u, 0x291bcd7du, 0xa9a4ea4cu, 0xcc3544b0u, 0x15141401u,
+            0x4cccd878u, 0x59280becu, 0x7474ac92u, 0x5337f73cu, 0x9eefb4b4u, 0x9cbadc25u, 0xf518dd58u, 0xbfc7a2e9u,
+            0x6e68e31au, 0x5555fca3u, 0x283ad224u, 0xaebd6549u, 0x6cdc0cd9u, 0x99c395f9u, 0xa7b0536cu, 0x40c0ad47u,
+            0x1500e835u, 0xb19a55ddu, 0x3d1c3137u, 0xbb7c5f7au, 0x10119e6bu, 0x0f141525u, 0xbda8f8e4u, 0xb1a94b82u,
+            0x026c5fcau, 0x3f15d20du, 0xd1691028u, 0xcfd4a281u, 0x2f27cdefu, 0xc1719664u, 0x983d8175u, 0x894efdbcu,
+            0x19e81461u, 0xbe06853fu, 0x0be0a328u, 0x5b457641u, 0xf51a7f46u, 0xcbf4366fu, 0x96ce586eu, 0x7678f1d5u,
+            0x62ef6c79u,
+        };
+        if (image.metadata.nametable_arrangement == NametableArrangement::FourScreen) {
+            for (const std::uint32_t c : kNotFourScreen) {
+                if (c == crc) image.metadata.nametable_arrangement = NametableArrangement::Horizontal;
+            }
+        }
         if (crc == 0xBDE3AE9Bu) {  // Doraemon (World 3 hack): mapper 66, vertical (header says 120, four-screen)
             image.metadata.mapper = 66;
             image.metadata.nametable_arrangement = NametableArrangement::Vertical;
