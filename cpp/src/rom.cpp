@@ -402,6 +402,22 @@ RomImage parse_ines(std::span<const std::uint8_t> bytes) {
     offset += metadata.prg_rom_size;
     image.chr_rom.assign(bytes.begin() + static_cast<std::ptrdiff_t>(offset),
                          bytes.begin() + static_cast<std::ptrdiff_t>(offset + metadata.chr_rom_size));
+    // FCEUmm's ines-correct.h overrides the header by the CRC32 of PRG + CHR. Only entries that no mapper-number rule
+    // covers are here.
+    {
+        std::uint32_t crc = 0xFFFFFFFFu;
+        for (const auto* rom : {&image.prg_rom, &image.chr_rom}) {
+            for (const std::uint8_t b : *rom) {
+                crc ^= b;
+                for (int k = 0; k < 8; ++k) crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+            }
+        }
+        crc = ~crc;
+        if (crc == 0xBDE3AE9Bu) {  // Doraemon (World 3 hack): mapper 66, vertical (header says 120, four-screen)
+            image.metadata.mapper = 66;
+            image.metadata.nametable_arrangement = NametableArrangement::Vertical;
+        }
+    }
     // Banked boards: as FCEUX does, an image whose PRG or CHR is not a power of two (PlayChoice dumps carry an 8 KB
     // INST-ROM after the CHR, some hacks grew the CHR) is padded with $FF up to one, so bank masks wrap cleanly.
     if (metadata.mapper != 0) {
