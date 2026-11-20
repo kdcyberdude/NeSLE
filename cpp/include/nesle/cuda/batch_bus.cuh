@@ -49,6 +49,15 @@ NESLE_CUDA_HD inline std::uint8_t bus_ppu_memory_read(BatchBuffers& buffers,
         if (address >= 0x3000) {
             address = static_cast<std::uint16_t>(address - 0x1000);
         }
+        if constexpr (Mode == kBankModePaged || Mode == kBankModeRuntime) {
+            if (cart_is_paged<Mode>(buffers.cart) && (buffers.mapper.mirroring[env] & kPageMapNtChr) != 0) {
+                const std::uint32_t q = (address >> 10) & 3u;
+                if (((buffers.mapper.mirroring[env] >> (4u + q)) & 1u) != 0) {
+                    const std::uint32_t page = paged::regs(buffers, env)[kNtChrPage + q];
+                    return buffers.cart.chr_rom[((page << 10) | (address & 0x3FFu)) % buffers.cart.chr_rom_size];
+                }
+            }
+        }
         return buffers.ppu.nametable_ram[static_cast<std::uint64_t>(env) * kNametableRamBytes +
                                         env_mirror_nametable_address<Mode>(buffers, env, address)];
     }
@@ -69,6 +78,12 @@ NESLE_CUDA_HD inline void bus_ppu_memory_write(BatchBuffers& buffers,
     if (address < 0x3F00) {
         if (address >= 0x3000) {
             address = static_cast<std::uint16_t>(address - 0x1000);
+        }
+        if constexpr (Mode == kBankModePaged || Mode == kBankModeRuntime) {
+            if (cart_is_paged<Mode>(buffers.cart) &&
+                ((buffers.mapper.mirroring[env] >> (4u + ((address >> 10) & 3u))) & 1u) != 0) {
+                return;  // a CHR ROM nametable
+            }
         }
         buffers.ppu.nametable_ram[static_cast<std::uint64_t>(env) * kNametableRamBytes +
                                   env_mirror_nametable_address<Mode>(buffers, env, address)] = value;
@@ -121,6 +136,8 @@ NESLE_CUDA_HD inline void bus_write_mapper(BatchBuffers& buffers,
             for (int i = 0; i < 8; ++i) before[i] = pages[i];
             const std::uint8_t mirroring = buffers.mapper.mirroring[env];
             const std::uint32_t creg = r[0] | (r[1] << 8) | (r[2] << 16) | (static_cast<std::uint32_t>(r[3]) << 24);
+            std::uint8_t nt_before[4];
+            for (std::uint32_t q = 0; q < 4u; ++q) nt_before[q] = r[kNtChrPage + q];
             write_mapper_register<Mode>(buffers, env, address, value);
             for (std::uint32_t i = 0; i < 8u; ++i) {
                 if (pages[i] != before[i]) frame_log_event(buffers, env, hot, kEvChr, (pages[i] >> 10) & 0xFFu,
@@ -132,6 +149,10 @@ NESLE_CUDA_HD inline void bus_write_mapper(BatchBuffers& buffers,
             if (buffers.cart.bank_kind == kBankingMmc2) {
                 for (std::uint32_t i = 0; i < 4u; ++i) {
                     if (r[i] != ((creg >> (8u * i)) & 0xFFu)) frame_log_event(buffers, env, hot, kEvMmc2, r[i], i);
+                }
+            } else {
+                for (std::uint32_t q = 0; q < 4u; ++q) {
+                    if (r[kNtChrPage + q] != nt_before[q]) frame_log_event(buffers, env, hot, kEvNtChr, r[kNtChrPage + q], q);
                 }
             }
             return;

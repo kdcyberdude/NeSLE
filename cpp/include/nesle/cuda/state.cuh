@@ -105,6 +105,10 @@ constexpr int kChrPages = 8;          // 1 KB PPU pages at $0000-$1FFF
 // A chr_page entry with this bit maps the 1 KB page to CHR RAM on a CHR ROM board (TQROM, 119). The board has no
 // PRG RAM, so its 8 KB of CHR RAM lives in the env's prg_ram buffer; the offset's low 13 bits index it.
 constexpr std::uint32_t kChrPageRam = 0x80000000u;
+// Nametable page map bits 4-7: that quadrant reads a 1 KB CHR ROM page (board register kNtChrPage + quadrant)
+// instead of CIRAM, and ignores writes (Namco 163, Sunsoft-4).
+constexpr std::uint8_t kPageMapNtChr = 0xF0u;
+constexpr std::uint32_t kNtChrPage = 44;  // 4 board registers, one per quadrant
 constexpr int kMapperRegBytes = 48;   // board registers, layout per board in mapper.cuh
 
 // How the $8000-$FFFF window is split. Resolved once on the host from the iNES
@@ -171,6 +175,8 @@ enum BankKind : std::uint8_t {
     kBankingM222,          // 222: Dragon Ninja pirate: 8 KB PRG x2, 1 KB CHR x8, scanline IRQ up-counter loaded at $F000
     kBankingBandai16,      // 16: Bandai FCG + 24C02 EEPROM (data in prg_ram): 16 KB PRG, 1 KB CHR, CPU-cycle IRQ
     kBankingFfe,           // 17 (and 6): FFE as old FCEUmm runs both: $8000 latch 16 KB PRG / 8 KB CHR, $42FE mirroring, $4500 cycle IRQ
+    kBankingN163,          // 19: Namco 163 (old n106.c): 8 KB PRG x3, 1 KB CHR x8, CHR ROM or CIRAM nametables, 15-bit cycle IRQ
+    kBankingSunsoft4,      // 68: Sunsoft-4: 16 KB PRG, 2 KB CHR x4, nametables from CHR ROM pages 128+
     kBankingFirstPaged = kBankingCnrom,
 };
 

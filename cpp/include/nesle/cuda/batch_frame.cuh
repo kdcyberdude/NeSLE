@@ -98,6 +98,7 @@ enum FrameLogEvent : std::uint8_t {
     kEvChr = 8,        // aux = CHR slot | page bits 8-9 << 3 | CHR RAM << 5, value = 1 KB page bits 0-7
     kEvMirror = 9,     // value = nametable page map
     kEvMmc2 = 10,      // aux = MMC2 register (0-3 CHR, 6-7 latches), value
+    kEvNtChr = 11,     // aux = quadrant, value = its CHR ROM nametable page (kPageMapNtChr); kept in creg
 };
 
 NESLE_CUDA_FRAME_HD NESLE_CUDA_FRAME_INLINE std::uint32_t* frame_log_bank(const BatchBuffers& b,
@@ -139,6 +140,10 @@ NESLE_CUDA_FRAME_HD inline void frame_log_fill_header(const BatchBuffers& b,
             const std::uint8_t* r = paged::regs(b, env);
             h[5] |= (static_cast<std::uint32_t>(r[paged::kMmc2Latch0] & 1u) << 8) |
                     (static_cast<std::uint32_t>(r[paged::kMmc2Latch1] & 1u) << 16);
+            h[6] = r[0] | (static_cast<std::uint32_t>(r[1]) << 8) | (static_cast<std::uint32_t>(r[2]) << 16) |
+                   (static_cast<std::uint32_t>(r[3]) << 24);
+        } else {  // other boards: the CHR ROM nametable pages (replayed in creg)
+            const std::uint8_t* r = paged::regs(b, env) + kNtChrPage;
             h[6] = r[0] | (static_cast<std::uint32_t>(r[1]) << 8) | (static_cast<std::uint32_t>(r[2]) << 16) |
                    (static_cast<std::uint32_t>(r[3]) << 24);
         }
@@ -484,6 +489,10 @@ NESLE_CUDA_FRAME_HD NESLE_CUDA_FRAME_INLINE std::uint8_t replay_nt(const ReplayS
     const std::uint32_t index = (address - 0x2000u) & 0x0FFFu;
     std::uint32_t offset;
     if (b.cart.bank_kind >= kBankingFirstPaged) {
+        if (((s.mirroring >> (4u + (index >> 10))) & 1u) != 0) {
+            return b.cart.chr_rom[((static_cast<std::uint32_t>(s.creg[index >> 10]) << 10) | (index & 0x3FFu)) %
+                                  b.cart.chr_rom_size];
+        }
         offset = (((s.mirroring >> (index >> 10)) & 1u) << 10) | (index & 0x3FFu);
     } else {
         offset = mirror_nametable_address(b.cart.nametable_arrangement, static_cast<std::uint16_t>(address));
@@ -576,6 +585,9 @@ NESLE_CUDA_FRAME_HD inline void replay_apply(const ReplaySource& src, ReplayStat
             break;
         case kEvMirror:
             s.mirroring = static_cast<std::uint8_t>(value);
+            break;
+        case kEvNtChr:
+            s.creg[aux & 3u] = static_cast<std::uint8_t>(value);
             break;
         case kEvMmc2:
             if (aux < 4u) {
