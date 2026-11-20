@@ -199,7 +199,8 @@ constexpr std::uint32_t kMmc3PreRenderClockDot = 256;
 template <BankMode Mode>
 NESLE_CUDA_HD inline bool batch_ppu_has_scanline_counter(const BatchBuffers& buffers) {
     if constexpr (Mode == kBankModePaged || Mode == kBankModeRuntime) {
-        return buffers.cart.bank_kind == kBankingMmc3 && buffers.mapper.regs != nullptr;
+        return (buffers.cart.bank_kind == kBankingMmc3 || buffers.cart.bank_kind == kBankingM91) &&
+               buffers.mapper.regs != nullptr;
     } else {
         return false;
     }

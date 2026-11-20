@@ -188,7 +188,7 @@ MapperLayout describe_mapper(const RomMetadata& metadata) noexcept {
             break;
         }
 
-        case 15: case 32: case 88:
+        case 15: case 32: case 88: case 91: case 42:
         case 24: case 26: case 40: case 232:
         case 21: case 22: case 23: case 25: case 69:
         case 7: case 11: case 66: case 71: case 79: case 113: case 140: case 38: case 87: {
@@ -213,6 +213,8 @@ MapperLayout describe_mapper(const RomMetadata& metadata) noexcept {
                 case 15: layout.bank_kind = kBankKindM15; break;
                 case 32: layout.bank_kind = kBankKindIrem32; break;
                 case 88: layout.bank_kind = kBankKindNamco88; break;
+                case 91: layout.bank_kind = kBankKindM91; break;
+                case 42: layout.bank_kind = kBankKindM42; break;
                 case 38: layout.bank_kind = kBankKindBitCorp38; break;
                 default: layout.bank_kind = kBankKindJaleco87; break;
             }

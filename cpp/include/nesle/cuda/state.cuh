@@ -148,6 +148,8 @@ enum BankKind : std::uint8_t {
     kBankingM15,          // 15: 100-in-1 Contra Function 16: address bits 0-1 pick the PRG mode, data the bank
     kBankingIrem32,       // 32: Irem G-101: two 8 KB PRG (swappable), 8 x 1 KB CHR
     kBankingNamco88,      // 88: Namco 108 with CHR A16 forced high for $1000-$1FFF
+    kBankingM91,          // 91: pirate fighters: registers at $6000-$7FFF, 2 KB CHR, 8-scanline IRQ
+    kBankingM42,          // 42: FDS conversions: ROM bank at $6000, last 32 KB fixed, 8 KB CHR, CPU-cycle IRQ
     kBankingFirstPaged = kBankingCnrom,
 };
 

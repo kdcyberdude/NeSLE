@@ -458,6 +458,24 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void sync(const BatchBuffers& buff
             set_prg8(buffers, env, 2, ~1u);
             set_prg8(buffers, env, 3, ~0u);
             break;
+        case kBankingM91: {  // [0..3] CHR 2 KB [4,5] PRG [6] IRQ on [7] IRQ count [8] outer bank
+            const std::uint32_t outer = r[8];
+            set_prg8(buffers, env, 0, r[4] | ((outer & 6u) << 3));
+            set_prg8(buffers, env, 1, r[5] | ((outer & 6u) << 3));
+            set_prg8(buffers, env, 2, 0x0Eu | ((outer & 6u) << 3));
+            set_prg8(buffers, env, 3, 0x0Fu | ((outer & 6u) << 3));
+            for (std::uint32_t i = 0; i < 4u; ++i) {
+                const std::uint32_t bank = r[i] | ((outer & 1u) << 8);
+                set_chr1(buffers, env, 2u * i, bank * 2u);
+                set_chr1(buffers, env, 2u * i + 1u, bank * 2u + 1u);
+            }
+            break;
+        }
+        case kBankingM42:  // [0] $6000 bank [1] CHR [2] mirroring (1 = vertical) [3] IRQ on [4,5] IRQ count
+            set_prg32(buffers, env, ~0u);
+            set_chr8(buffers, env, r[1]);
+            set_mirroring(buffers, env, r[2] != 0 ? kPageMapVertical : kPageMapHorizontal);
+            break;
         case kBankingFme7: {
             for (std::uint32_t i = 0; i < 3u; ++i) set_prg8(buffers, env, i, r[kFmePrg + i] & 0x3Fu);
             set_prg8(buffers, env, 3, ~0u);
@@ -498,6 +516,9 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void power_on(const BatchBuffers& 
             r[kVrc6Control] = buffers.cart.nametable_arrangement == kNametableHorizontal ? 4u : 0u;
             break;
         case kBankingNina001:
+            r[2] = 1;
+            break;
+        case kBankingM42:
             r[2] = 1;
             break;
         case kBankingFme7:
@@ -558,6 +579,26 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void write(BatchBuffers& buffers,
             if (address < 0x6000u) return;
         } else if (kind == kBankingBitCorp38) {
             if (address < 0x7000u) return;
+        } else if (kind == kBankingM91) {
+            if (address < 0x6000u) return;
+            if (address < 0x7000u) {
+                if ((address & 7u) < 4u) {
+                    r[address & 3u] = value;
+                } else if ((address & 7u) < 6u) {
+                    r[9] = static_cast<std::uint8_t>(value & 1u);  // submapper 1 only (Super Fighter III)
+                    return;
+                } else {
+                    return;
+                }
+            } else {
+                switch (address & 3u) {
+                    case 0: case 1: r[4u + (address & 1u)] = value; break;
+                    case 2: r[6] = 0; r[7] = 0; buffers.cpu.irq_pending[env] = 0; return;
+                    default: r[6] = 1; buffers.cpu.irq_pending[env] = 0; return;
+                }
+            }
+            sync(buffers, env);
+            return;
         } else if (kind == kBankingNina001) {
             if (address < 0x7FFDu) return;
             r[address - 0x7FFDu] = value;
@@ -675,6 +716,23 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void write(BatchBuffers& buffers,
             break;
         case kBankingNina001:
             r[0] = value;
+            break;
+        case kBankingM91:
+            if (address >= 0xA000u) return;
+            r[8] = static_cast<std::uint8_t>(address & 7u);
+            break;
+        case kBankingM42:
+            switch (address & 0xE003u) {
+                case 0x8000u: r[1] = value; break;
+                case 0xE000u: r[0] = static_cast<std::uint8_t>(value & 0x0Fu); return;
+                case 0xE001u: r[2] = static_cast<std::uint8_t>(((value >> 3) & 1u) ^ 1u); break;
+                case 0xE002u:
+                    r[3] = static_cast<std::uint8_t>(value & 2u);
+                    if (r[3] == 0) { r[4] = 0; r[5] = 0; }
+                    buffers.cpu.irq_pending[env] = 0;
+                    return;
+                default: return;
+            }
             break;
         case kBankingM15:
             r[0] = value;
@@ -846,6 +904,15 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void cpu_cycles(BatchBuffers& buff
                                                               std::uint32_t cycles) {
     std::uint8_t* r = regs(buffers, env);
     const std::uint8_t kind = buffers.cart.bank_kind;
+    if (kind == kBankingM42) {  // M42IRQHook: 15-bit cycle count, line high from 24576
+        if (r[3] == 0) return;
+        std::uint32_t count = (r[4] | (static_cast<std::uint32_t>(r[5]) << 8)) + cycles;
+        count &= 0x7FFFu;
+        r[4] = static_cast<std::uint8_t>(count & 0xFFu);
+        r[5] = static_cast<std::uint8_t>(count >> 8);
+        buffers.cpu.irq_pending[env] = count >= 24576u ? 1 : 0;
+        return;
+    }
     if (kind == kBankingMmc3) {
         if (buffers.cart.mapper != 64 || r[kRamboIrqMode] == 0) return;
         std::uint32_t pre = r[kRamboPre] + cycles;  // RAMBO1IRQHook: one clock per 4 CPU cycles
@@ -905,6 +972,10 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE bool read_6000_rom(const BatchBuff
         out = buffers.cart.prg_rom[((6u & buffers.cart.prg_page_mask) << 13) + (address & 0x1FFFu)];
         return true;
     }
+    if (buffers.cart.bank_kind == kBankingM42) {
+        out = buffers.cart.prg_rom[((regs(buffers, env)[0] & buffers.cart.prg_page_mask) << 13) + (address & 0x1FFFu)];
+        return true;
+    }
     if (buffers.cart.bank_kind != kBankingFme7) return false;
     const std::uint8_t reg = regs(buffers, env)[kFmePrg6];
     if ((reg & 0x40u) != 0) return false;
@@ -915,6 +986,10 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE bool read_6000_rom(const BatchBuff
 // MMC3 scanline counter clock (FCEUmm ClockMMC3Counter, revision B). RAMBO-1 (64): RAMBO1HBHook.
 NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void mmc3_clock(BatchBuffers& buffers, std::uint32_t env) {
     std::uint8_t* r = regs(buffers, env);
+    if (buffers.cart.bank_kind == kBankingM91) {  // M91IRQHook: IRQ after 8 scanlines
+        if (r[6] != 0 && r[7] < 8u && ++r[7] >= 8u) buffers.cpu.irq_pending[env] = 1;
+        return;
+    }
     if (buffers.cart.mapper == 64) {
         if (r[kRamboIrqMode] == 0) {
             r[kRamboRmode] = 0;
@@ -1004,7 +1079,7 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void mapper_cpu_cycles(BatchBuffer
     if constexpr (Mode == kBankModePaged || Mode == kBankModeRuntime) {
         const std::uint8_t kind = buffers.cart.bank_kind;
         if ((paged::kind_is_vrc(kind) || kind == kBankingFme7 || kind == kBankingSmb2j40 ||
-             (kind == kBankingMmc3 && buffers.cart.mapper == 64)) &&
+             kind == kBankingM42 || (kind == kBankingMmc3 && buffers.cart.mapper == 64)) &&
             buffers.mapper.regs != nullptr) {
             paged::cpu_cycles(buffers, env, cycles);
         }
