@@ -252,8 +252,8 @@ MapperLayout describe_mapper(const RomMetadata& metadata) noexcept {
             layout.supported = metadata.prg_rom_size >= 0x4000 && metadata.prg_rom_size <= 512u * 1024u &&
                                page_count_is_power_of_two(metadata.prg_rom_size, 0x2000) &&
                                chr_bytes <= 1024u * 1024u && page_count_is_power_of_two(chr_bytes, 0x2000) &&
-                               // FCEUmm writes a trainer to $7000 at power; the hosts have no path for it yet.
-                               !metadata.has_trainer;
+                               // A trainer is copied to $7000 (prg_ram + $1000) by the host at power; FFE only.
+                               (!metadata.has_trainer || layout.bank_kind == kBankKindFfe);
             break;
         }
 
@@ -405,6 +405,10 @@ RomImage parse_ines(std::span<const std::uint8_t> bytes) {
 
     RomImage image;
     image.metadata = metadata;
+    if (metadata.has_trainer) {
+        image.trainer.assign(bytes.begin() + static_cast<std::ptrdiff_t>(kHeaderSize),
+                             bytes.begin() + static_cast<std::ptrdiff_t>(kHeaderSize + kTrainerSize));
+    }
     image.prg_rom.assign(bytes.begin() + static_cast<std::ptrdiff_t>(offset),
                          bytes.begin() + static_cast<std::ptrdiff_t>(offset + metadata.prg_rom_size));
     offset += metadata.prg_rom_size;

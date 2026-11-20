@@ -117,6 +117,7 @@ struct RomImage {
     RomMetadata metadata;
     std::vector<std::uint8_t> prg_rom;
     std::vector<std::uint8_t> chr_rom;
+    std::vector<std::uint8_t> trainer;  // the 512-byte trainer, if the header has one (FCEUmm writes it to $7000)
 };
 
 [[nodiscard]] RomImage parse_ines(std::span<const std::uint8_t> bytes);
