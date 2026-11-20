@@ -158,6 +158,30 @@ MapperLayout describe_mapper(const RomMetadata& metadata) noexcept {
                                page_count_is_power_of_two(metadata.prg_rom_size, 0x8000);
             break;
 
+        case 5: {  // MMC5. WRAM size from FCEUmm's MMC5CartList (unknown carts: 64 KB)
+            struct Size { std::uint32_t crc; std::uint32_t kb; };
+            static constexpr Size kList[] = {
+                {0x6f4e4312u, 32}, {0x15fe6d0fu, 16}, {0x671f23a8u, 0}, {0xcd4e7430u, 0}, {0xed2465beu, 0},
+                {0xfe3488d1u, 16}, {0x0ec6c023u, 8}, {0x0afb395eu, 0}, {0x1ced086fu, 16}, {0x9cbadc25u, 8},
+                {0x6396b988u, 16}, {0x9c18762bu, 16}, {0xb0480ae9u, 0}, {0xb4735facu, 0}, {0xf540677bu, 32},
+                {0xeee9a682u, 16}, {0xf9b4240fu, 16}, {0x8ce478dbu, 16}, {0xf011e490u, 32}, {0xbc80fb52u, 8},
+                {0x184c2124u, 32}, {0xee8e6553u, 32}, {0xd532e98fu, 8}, {0x39f2ce4bu, 16}, {0xbb7f829au, 0},
+                {0xaca15643u, 16}};
+            std::uint32_t kb = 64;
+            for (const auto& e : kList) {
+                if (e.crc == metadata.crc32) kb = e.kb;
+            }
+            const std::size_t chr_bytes =
+                metadata.chr_rom_size == 0 ? std::size_t{8 * 1024} : metadata.chr_rom_size;
+            layout.bank_kind = kBankKindMmc5;
+            layout.prg_page_mask = static_cast<std::uint16_t>(metadata.prg_rom_size / 0x2000 - 1);
+            layout.chr_page_mask = static_cast<std::uint16_t>(chr_bytes / 0x400 - 1);
+            layout.ext_ram_bytes = 0x1000u + kb * 1024u;
+            layout.supported = metadata.prg_rom_size >= 0x8000 && metadata.prg_rom_size <= 1024u * 1024u &&
+                               page_count_is_power_of_two(metadata.prg_rom_size, 0x2000) &&
+                               chr_bytes <= 1024u * 1024u && page_count_is_power_of_two(chr_bytes, 0x2000);
+            break;
+        }
         case 1:   // MMC1 (SxROM)
         case 105: // NWC 1990: MMC1 with a timer IRQ
         case 3:   // CNROM
@@ -425,6 +449,7 @@ RomImage parse_ines(std::span<const std::uint8_t> bytes) {
             }
         }
         crc = ~crc;
+        image.metadata.crc32 = crc;
         if (crc == 0xBDE3AE9Bu) {  // Doraemon (World 3 hack): mapper 66, vertical (header says 120, four-screen)
             image.metadata.mapper = 66;
             image.metadata.nametable_arrangement = NametableArrangement::Vertical;

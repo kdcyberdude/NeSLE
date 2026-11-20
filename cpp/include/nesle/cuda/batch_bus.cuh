@@ -50,6 +50,18 @@ NESLE_CUDA_HD inline std::uint8_t bus_ppu_memory_read(BatchBuffers& buffers,
             address = static_cast<std::uint16_t>(address - 0x1000);
         }
         if constexpr (Mode == kBankModePaged || Mode == kBankModeRuntime) {
+            if (buffers.cart.bank_kind == kBankingMmc5) {  // vnapage: CIRAM 0/1, ExRAM, or the fill page
+                const std::uint32_t m = (buffers.mapper.mirroring[env] >> (2u * ((address >> 10) & 3u))) & 3u;
+                const std::uint8_t* r = paged::regs(buffers, env);
+                if (m == 2u) return paged::mmc5_ext(buffers, env)[kMmc5ExRam + (address & 0x3FFu)];
+                if (m == 3u) {
+                    if ((address & 0x3FFu) < 0x3C0u) return r[paged::kM5NtFill];
+                    const std::uint32_t at = r[paged::kM5AtFill] & 3u;
+                    return static_cast<std::uint8_t>(at | (at << 2) | (at << 4) | (at << 6));
+                }
+                return buffers.ppu.nametable_ram[static_cast<std::uint64_t>(env) * kNametableRamBytes + (m << 10) +
+                                                 (address & 0x3FFu)];
+            }
             if (cart_is_paged<Mode>(buffers.cart) && (buffers.mapper.mirroring[env] & kPageMapNtChr) != 0) {
                 const std::uint32_t q = (address >> 10) & 3u;
                 if (((buffers.mapper.mirroring[env] >> (4u + q)) & 1u) != 0) {
@@ -80,6 +92,15 @@ NESLE_CUDA_HD inline void bus_ppu_memory_write(BatchBuffers& buffers,
             address = static_cast<std::uint16_t>(address - 0x1000);
         }
         if constexpr (Mode == kBankModePaged || Mode == kBankModeRuntime) {
+            if (buffers.cart.bank_kind == kBankingMmc5) {
+                const std::uint32_t m = (buffers.mapper.mirroring[env] >> (2u * ((address >> 10) & 3u))) & 3u;
+                if (m == 2u) paged::mmc5_ext(buffers, env)[kMmc5ExRam + (address & 0x3FFu)] = value;
+                if (m < 2u) {
+                    buffers.ppu.nametable_ram[static_cast<std::uint64_t>(env) * kNametableRamBytes + (m << 10) +
+                                              (address & 0x3FFu)] = value;
+                }
+                return;  // the fill page is read-only
+            }
             if (cart_is_paged<Mode>(buffers.cart) &&
                 ((buffers.mapper.mirroring[env] >> (4u + ((address >> 10) & 3u))) & 1u) != 0) {
                 return;  // a CHR ROM nametable
@@ -138,6 +159,12 @@ NESLE_CUDA_HD inline void bus_write_mapper(BatchBuffers& buffers,
             const std::uint32_t creg = r[0] | (r[1] << 8) | (r[2] << 16) | (static_cast<std::uint32_t>(r[3]) << 24);
             std::uint8_t nt_before[4];
             for (std::uint32_t q = 0; q < 4u; ++q) nt_before[q] = r[kNtChrPage + q];
+            std::uint8_t m5_before[24] = {};  // MMC5: CHR banks A/B (low, high) and vsize
+            if (buffers.cart.bank_kind == kBankingMmc5) {
+                for (std::uint32_t i = 0; i < 24u; ++i) m5_before[i] = r[paged::kM5ALo + i];
+            }
+            const std::uint8_t m5_vsize = r[paged::kM5VSize], m5_ab = r[paged::kM5AB],
+                               m5_mode = r[paged::kM5ChrMode], m5_hi = r[paged::kM5Hi];
             write_mapper_register<Mode>(buffers, env, address, value);
             for (std::uint32_t i = 0; i < 8u; ++i) {
                 if (pages[i] != before[i]) frame_log_event(buffers, env, hot, kEvChr, (pages[i] >> 10) & 0xFFu,
@@ -154,6 +181,19 @@ NESLE_CUDA_HD inline void bus_write_mapper(BatchBuffers& buffers,
                 for (std::uint32_t q = 0; q < 4u; ++q) {
                     if (r[kNtChrPage + q] != nt_before[q]) frame_log_event(buffers, env, hot, kEvNtChr, r[kNtChrPage + q], q);
                 }
+            }
+            if (buffers.cart.bank_kind == kBankingMmc5) {  // kEvMmc5: aux = bank 0-7 A, 8-11 B, 12 vsize | bits 8-9 << 4
+                for (std::uint32_t i = 0; i < 12u; ++i) {
+                    const std::uint32_t lo = i < 8u ? paged::kM5ALo + i : paged::kM5BLo + i - 8u;
+                    const std::uint32_t hi = lo + (i < 8u ? 8u : 4u);
+                    if (r[lo] != m5_before[lo - paged::kM5ALo] || r[hi] != m5_before[hi - paged::kM5ALo]) {
+                        frame_log_event(buffers, env, hot, kEvMmc5, r[lo], i | ((r[hi] & 3u) << 4));
+                    }
+                }
+                if (r[paged::kM5VSize] != m5_vsize) frame_log_event(buffers, env, hot, kEvMmc5, r[paged::kM5VSize], 12u);
+                if (r[paged::kM5AB] != m5_ab) frame_log_event(buffers, env, hot, kEvMmc5, r[paged::kM5AB], 13u);
+                if (r[paged::kM5ChrMode] != m5_mode) frame_log_event(buffers, env, hot, kEvMmc5, r[paged::kM5ChrMode], 14u);
+                if (r[paged::kM5Hi] != m5_hi) frame_log_event(buffers, env, hot, kEvMmc5, r[paged::kM5Hi], 15u);
             }
             return;
         }

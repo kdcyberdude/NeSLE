@@ -109,6 +109,10 @@ constexpr std::uint32_t kChrPageRam = 0x80000000u;
 // instead of CIRAM, and ignores writes (Namco 163, Sunsoft-4).
 constexpr std::uint8_t kPageMapNtChr = 0xF0u;
 constexpr std::uint32_t kNtChrPage = 44;  // 4 board registers, one per quadrant
+// prg_page flags (MMC5): the page is WRAM (offset into ext_ram), or nothing (open bus).
+constexpr std::uint32_t kPrgPageRam = 0x80000000u;
+constexpr std::uint32_t kPrgPageOpen = 0x40000000u;
+constexpr std::uint32_t kMmc5ExRam = 0x000u, kMmc5ExSnap = 0x400u, kMmc5ExHeader = 0x800u, kMmc5ExWram = 0x1000u;
 constexpr int kMapperRegBytes = 48;   // board registers, layout per board in mapper.cuh
 
 // How the $8000-$FFFF window is split. Resolved once on the host from the iNES
@@ -177,6 +181,7 @@ enum BankKind : std::uint8_t {
     kBankingFfe,           // 17 (and 6): FFE as old FCEUmm runs both: $8000 latch 16 KB PRG / 8 KB CHR, $42FE mirroring, $4500 cycle IRQ
     kBankingN163,          // 19: Namco 163 (old n106.c): 8 KB PRG x3, 1 KB CHR x8, CHR ROM or CIRAM nametables, 15-bit cycle IRQ
     kBankingSunsoft4,      // 68: Sunsoft-4: 16 KB PRG, 2 KB CHR x4, nametables from CHR ROM pages 128+
+    kBankingMmc5,          // 5: MMC5 (old mmc5.c): PRG/WRAM modes, A/B CHR sets, ExRAM and fill nametables, line IRQ, multiplier
     kBankingFirstPaged = kBankingCnrom,
 };
 
@@ -294,6 +299,8 @@ struct CartridgeView {
     // (CHR ROM, or the 8 KB of CHR RAM). Both page counts are powers of two.
     std::uint16_t prg_page_mask;
     std::uint16_t chr_page_mask;
+    // Bytes per env of MapperStateSoA::ext_ram; 0 = the board has none (every board but MMC5).
+    std::uint32_t ext_ram_bytes;
 };
 
 // Per-environment mapper registers. One byte per env keeps the batch layout
@@ -308,6 +315,10 @@ struct MapperStateSoA {
     std::uint32_t* NESLE_RESTRICT chr_page;  // kChrPages per env: byte offset into CHR ROM/RAM
     std::uint8_t* NESLE_RESTRICT mirroring;  // per-env nametable page map (kPageMap*)
     std::uint8_t* NESLE_RESTRICT regs;       // kMapperRegBytes per env
+    // Boards with more memory than the shared arrays hold (cart.ext_ram_bytes per env, else nullptr).
+    // MMC5: [0, $400) ExRAM, [$400, $800) its vblank snapshot, [$800, $840) the CHR registers each log bank
+    // starts from, [$1000, ...) WRAM.
+    std::uint8_t* NESLE_RESTRICT ext_ram;
 };
 
 // The PPU fields read/modified on every emulated instruction. The step kernel

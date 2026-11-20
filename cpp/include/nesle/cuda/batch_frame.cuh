@@ -99,6 +99,7 @@ enum FrameLogEvent : std::uint8_t {
     kEvMirror = 9,     // value = nametable page map
     kEvMmc2 = 10,      // aux = MMC2 register (0-3 CHR, 6-7 latches), value
     kEvNtChr = 11,     // aux = quadrant, value = its CHR ROM nametable page (kPageMapNtChr); kept in creg
+    kEvMmc5 = 12,      // aux = CHR bank 0-7 (A) / 8-11 (B) | bits 8-9 << 4, 12 = $5101, 13 = A/B mode; value
 };
 
 NESLE_CUDA_FRAME_HD NESLE_CUDA_FRAME_INLINE std::uint32_t* frame_log_bank(const BatchBuffers& b,
@@ -156,6 +157,19 @@ NESLE_CUDA_FRAME_HD inline void frame_log_fill_header(const BatchBuffers& b,
     }
 }
 
+// MMC5: the CHR registers log bank `bank` starts from (no room in the 16-word header): banks A and B low/high,
+// $5101, A/B mode, in ext_ram at kMmc5ExHeader + 32 * bank.
+NESLE_CUDA_FRAME_HD inline void frame_log_mmc5_header(const BatchBuffers& b, std::uint32_t env, std::uint32_t bank) {
+    if (b.cart.bank_kind != kBankingMmc5 || b.mapper.ext_ram == nullptr) return;
+    const std::uint8_t* r = paged::regs(b, env);
+    std::uint8_t* x = paged::mmc5_ext(b, env) + kMmc5ExHeader + 32u * (bank & 1u);
+    for (std::uint32_t i = 0; i < 24u; ++i) x[i] = r[paged::kM5ALo + i];
+    x[24] = r[paged::kM5VSize];
+    x[25] = r[paged::kM5AB];
+    x[26] = static_cast<std::uint8_t>(r[paged::kM5ChrMode] & 3u);
+    x[27] = r[paged::kM5Hi];
+}
+
 // Pre-render line: the writing bank starts over from the live state (the caller's
 // hot.log_n becomes 0). Returns the new log_bank. (Scalars in and out: a reference to
 // the register-resident PpuHotState would push it to memory for the whole kernel.)
@@ -166,6 +180,7 @@ NESLE_CUDA_FRAME_HD NESLE_CUDA_FRAME_COLD std::uint8_t frame_log_capture(const B
                                                                        std::uint8_t log_bank) {
     std::uint32_t* h = frame_log_bank(b, env, (log_bank & 1u) ^ 1u);
     frame_log_fill_header(b, env, ctrl, mask, h);
+    frame_log_mmc5_header(b, env, (log_bank & 1u) ^ 1u);
     const bool kook = (log_bank & kLogNextKook) != 0;
     if (kook) h[15] |= kLogKook;
     return static_cast<std::uint8_t>(((log_bank ^ kLogNextKook) & ~kLogShortFrame) | (kook ? kLogShortFrame : 0u));
@@ -228,6 +243,12 @@ NESLE_CUDA_FRAME_HD inline void frame_log_reset(BatchBuffers& b, std::uint32_t e
     }
     frame_log_fill_header(b, env, b.ppu.ctrl[env], b.ppu.mask[env], frame_log_bank(b, env, 0));
     frame_log_fill_header(b, env, b.ppu.ctrl[env], b.ppu.mask[env], frame_log_bank(b, env, 1));
+    frame_log_mmc5_header(b, env, 0);
+    frame_log_mmc5_header(b, env, 1);
+    if (b.cart.bank_kind == kBankingMmc5) {
+        std::uint8_t* x = paged::mmc5_ext(b, env);
+        for (std::uint32_t i = 0; i < 0x400u; ++i) x[kMmc5ExSnap + i] = x[kMmc5ExRam + i];
+    }
     b.ppu.log_count[env] = 0;
     b.ppu.log_bank[env] = 0;
     if (b.ppu.snap_nametable != nullptr) {
@@ -393,6 +414,12 @@ struct ReplayState {
     std::uint8_t mirroring;  // paged boards
     std::uint16_t chr[8];    // paged boards: 1 KB page per slot
     std::uint8_t creg[4];    // MMC2
+    std::uint16_t m5a[8];    // MMC5: CHR banks A (sprites), B (background), $5101, A/B mode
+    std::uint16_t m5b[4];
+    std::uint8_t m5vsize;
+    std::uint8_t m5ab;
+    std::uint8_t m5chrmode;  // $5104 & 3 (MMC5HackCHRMode)
+    std::uint8_t m5hi;       // $5130
     std::uint8_t latch[2];   // MMC2
     std::uint8_t pal[32];
     std::uint32_t pshift0;
@@ -462,9 +489,17 @@ NESLE_CUDA_FRAME_HD NESLE_CUDA_FRAME_INLINE void replay_load_header(ReplayState&
 // CHR byte through the replay's own bank state (paged boards), else the fixed wiring.
 NESLE_CUDA_FRAME_HD NESLE_CUDA_FRAME_INLINE std::uint8_t replay_chr(const ReplaySource& src,
                                                                     const ReplayState& s,
-                                                                    std::uint32_t address) {
+                                                                    std::uint32_t address,
+                                                                    bool sprite = false) {
     const BatchBuffers& b = *src.b;
     address &= 0x1FFFu;
+    if (b.cart.bank_kind == kBankingMmc5) {  // sprites: set A; background: B with 8x16 sprites or in B mode, else A
+        const bool set_b = !sprite && ((s.ctrl & 0x20u) != 0 || s.m5ab != 0);
+        const std::uint32_t page = paged::mmc5_chr_page(s.m5a, s.m5b, s.m5vsize, set_b, address >> 10);
+        const std::uint32_t offset = ((page & b.cart.chr_page_mask) << 10) | (address & 0x3FFu);
+        if (b.cart.chr_rom != nullptr) return b.cart.chr_rom[offset];
+        return b.ppu.chr_ram[static_cast<std::uint64_t>(src.env) * kChrRamBytes + (offset & 0x1FFFu)];
+    }
     if (b.cart.bank_kind >= kBankingFirstPaged) {
         const std::uint32_t page = s.chr[address >> 10];
         const std::uint32_t offset = ((page & b.cart.chr_page_mask) << 10) | (address & 0x3FFu);
@@ -482,12 +517,30 @@ NESLE_CUDA_FRAME_HD NESLE_CUDA_FRAME_INLINE std::uint8_t replay_chr(const Replay
     return b.cart.chr_rom[address % b.cart.chr_rom_size];
 }
 
+// MMC5 ExRAM byte: the vblank snapshot when drawing from the snapshots, else the live one.
+NESLE_CUDA_FRAME_HD NESLE_CUDA_FRAME_INLINE std::uint8_t replay_mmc5_exram(const ReplaySource& src, std::uint32_t index) {
+    const BatchBuffers& b = *src.b;
+    const bool snap = b.ppu.snap_nametable != nullptr &&
+                      src.nametable == b.ppu.snap_nametable + static_cast<std::uint64_t>(src.env) * kNametableRamBytes;
+    return paged::mmc5_ext(b, src.env)[(snap ? kMmc5ExSnap : kMmc5ExRam) + (index & 0x3FFu)];
+}
+
 NESLE_CUDA_FRAME_HD NESLE_CUDA_FRAME_INLINE std::uint8_t replay_nt(const ReplaySource& src,
                                                                    const ReplayState& s,
                                                                    std::uint32_t address) {
     const BatchBuffers& b = *src.b;
     const std::uint32_t index = (address - 0x2000u) & 0x0FFFu;
     std::uint32_t offset;
+    if (b.cart.bank_kind == kBankingMmc5) {
+        const std::uint32_t m = (s.mirroring >> (2u * (index >> 10))) & 3u;
+        if (m == 2u) return replay_mmc5_exram(src, index);
+        if (m == 3u) {
+            if ((index & 0x3FFu) < 0x3C0u) return s.creg[0];
+            const std::uint32_t at = s.creg[1] & 3u;
+            return static_cast<std::uint8_t>(at | (at << 2) | (at << 4) | (at << 6));
+        }
+        return src.nametable[(m << 10) | (index & 0x3FFu)];
+    }
     if (b.cart.bank_kind >= kBankingFirstPaged) {
         if (((s.mirroring >> (4u + (index >> 10))) & 1u) != 0) {
             return b.cart.chr_rom[((static_cast<std::uint32_t>(s.creg[index >> 10]) << 10) | (index & 0x3FFu)) %
@@ -589,6 +642,17 @@ NESLE_CUDA_FRAME_HD inline void replay_apply(const ReplaySource& src, ReplayStat
         case kEvNtChr:
             s.creg[aux & 3u] = static_cast<std::uint8_t>(value);
             break;
+        case kEvMmc5: {
+            const std::uint32_t id = aux & 0xFu;
+            const std::uint16_t bank = static_cast<std::uint16_t>(value | (((aux >> 4) & 3u) << 8));
+            if (id < 8u) s.m5a[id] = bank;
+            else if (id < 12u) s.m5b[id - 8u] = bank;
+            else if (id == 12u) s.m5vsize = static_cast<std::uint8_t>(value);
+            else if (id == 13u) s.m5ab = static_cast<std::uint8_t>(value);
+            else if (id == 14u) s.m5chrmode = static_cast<std::uint8_t>(value & 3u);
+            else s.m5hi = static_cast<std::uint8_t>(value);
+            break;
+        }
         case kEvMmc2:
             if (aux < 4u) {
                 s.creg[aux] = static_cast<std::uint8_t>(value);
@@ -606,6 +670,33 @@ NESLE_CUDA_FRAME_HD inline void replay_apply(const ReplaySource& src, ReplayStat
 // Pre-render line: the writes before line 0's sprite-free start (ResetRL, 16 dots before
 // it), and v = t there.
 NESLE_CUDA_FRAME_HD inline void replay_begin_frame(const ReplaySource& src, ReplayState& s) {
+    if (src.b->cart.bank_kind == kBankingMmc5) {  // the CHR registers the frame starts from (frame_log_mmc5_header)
+        const BatchBuffers& b = *src.b;
+        const std::uint8_t* x;
+        if (b.ppu.frame_log != nullptr && src.header == frame_log_bank(b, src.env, 1)) {
+            x = paged::mmc5_ext(b, src.env) + kMmc5ExHeader + 32u;
+        } else if (b.ppu.frame_log != nullptr && src.header == frame_log_bank(b, src.env, 0)) {
+            x = paged::mmc5_ext(b, src.env) + kMmc5ExHeader;
+        } else {
+            x = nullptr;
+        }
+        const std::uint8_t* r = paged::regs(b, src.env);
+        std::uint8_t live[28];
+        if (x == nullptr) {
+            for (std::uint32_t i = 0; i < 24u; ++i) live[i] = r[paged::kM5ALo + i];
+            live[24] = r[paged::kM5VSize];
+            live[25] = r[paged::kM5AB];
+            live[26] = static_cast<std::uint8_t>(r[paged::kM5ChrMode] & 3u);
+            live[27] = r[paged::kM5Hi];
+            x = live;
+        }
+        for (std::uint32_t i = 0; i < 8u; ++i) s.m5a[i] = static_cast<std::uint16_t>(x[i] | (x[8u + i] << 8));
+        for (std::uint32_t i = 0; i < 4u; ++i) s.m5b[i] = static_cast<std::uint16_t>(x[16u + i] | (x[20u + i] << 8));
+        s.m5vsize = x[24];
+        s.m5ab = x[25];
+        s.m5chrmode = x[26];
+        s.m5hi = x[27];
+    }
     while (s.cursor < src.count && event_start(src, s.cursor) < -16) {
         replay_apply(src, s, s.cursor++, false);
     }
@@ -664,11 +755,22 @@ NESLE_CUDA_FRAME_HD inline void replay_tiles(const ReplaySource& src, ReplayStat
         const std::uint32_t tile_index = replay_nt(src, s, nt_base | (v & 0x3FFu));
         const std::uint32_t zz = v & 0x1Fu;
         const std::uint32_t attr_byte = replay_nt(src, s, nt_base | 0x3C0u | (zz >> 2) | ((v & 0x380u) >> 4));
-        const std::uint32_t cc = (attr_byte >> ((zz & 2u) + ((v & 0x40u) >> 4))) & 3u;
+        std::uint32_t cc = (attr_byte >> ((zz & 2u) + ((v & 0x40u) >> 4))) & 3u;
         const std::uint32_t vadr = (tile_index << 4) + (((s.ctrl & 0x10u) << 8) | ((v >> 12) & 7u));
         // Both bytes through the bank before the hook: FCEUmm takes the CHR pointer first.
-        const std::uint8_t p0 = replay_chr(src, s, vadr);
-        const std::uint8_t p1 = replay_chr(src, s, vadr + 8u);
+        std::uint8_t p0, p1;
+        if (src.b->cart.bank_kind == kBankingMmc5 && s.m5chrmode == 1u && src.b->cart.chr_rom != nullptr) {
+            // PPUT_MMC5CHR1: ExRAM picks the tile's palette and its 4 KB CHR bank
+            const std::uint32_t ex = replay_mmc5_exram(src, v);
+            cc = (ex & 0xC0u) >> 6;
+            const std::uint32_t at = (((ex & 0x3Fu) & (src.b->cart.chr_page_mask >> 2)) << 12) + (vadr & 0xFFFu) +
+                                     ((s.m5hi & 3u) << 18);
+            p0 = src.b->cart.chr_rom[at % src.b->cart.chr_rom_size];
+            p1 = src.b->cart.chr_rom[(at + 8u) % src.b->cart.chr_rom_size];
+        } else {
+            p0 = replay_chr(src, s, vadr);
+            p1 = replay_chr(src, s, vadr + 8u);
+        }
         replay_mmc2_hook(src, s, vadr);
         s.atlatch = static_cast<std::uint8_t>((s.atlatch >> 2) | (cc << 2));
         s.pshift0 = (s.pshift0 << 8) | p0;
@@ -813,8 +915,8 @@ NESLE_CUDA_FRAME_HD inline void replay_end_of_line(const ReplaySource& src, Repl
             vadr &= 0x1FFFu;
             // Both bytes come through the bank the first one used: FCEUmm takes the CHR
             // pointer before the MMC2 hook can switch it.
-            f.lo[f.n] = replay_chr(src, s, vadr);
-            f.hi[f.n] = replay_chr(src, s, vadr + 8u);
+            f.lo[f.n] = replay_chr(src, s, vadr, true);
+            f.hi[f.n] = replay_chr(src, s, vadr + 8u, true);
             replay_mmc2_hook(src, s, vadr);
             f.attr[f.n] = spr[2];
             f.x[f.n] = spr[3];

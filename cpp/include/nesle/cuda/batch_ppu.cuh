@@ -201,7 +201,8 @@ NESLE_CUDA_HD inline bool batch_ppu_has_scanline_counter(const BatchBuffers& buf
     if constexpr (Mode == kBankModePaged || Mode == kBankModeRuntime) {
         return (buffers.cart.bank_kind == kBankingMmc3 || buffers.cart.bank_kind == kBankingM91 ||
                 buffers.cart.bank_kind == kBankingJy90 || buffers.cart.bank_kind == kBankingTaito48 ||
-                buffers.cart.bank_kind == kBankingM117 || buffers.cart.bank_kind == kBankingM222) &&
+                buffers.cart.bank_kind == kBankingM117 || buffers.cart.bank_kind == kBankingM222 ||
+                buffers.cart.bank_kind == kBankingMmc5) &&
                buffers.mapper.regs != nullptr;
     } else {
         return false;
@@ -212,13 +213,23 @@ NESLE_CUDA_HD inline bool batch_ppu_has_scanline_counter(const BatchBuffers& buf
 // 59 dots after the MMC3 hook) and next to the MMC3 hook on the pre-render line, with no pattern-table test.
 constexpr std::uint32_t kJyVisibleClockDot = 325;
 
+// MMC5 (MMC5_hb) runs at the start of DoLine for lines 0-239 and once after line 239 (it resets there), while
+// background or sprites are on, with no pattern-table test. A marker value: its line-start schedule is its own.
+constexpr std::uint32_t kMmc5LineDot = 0x10000u;
+
 NESLE_CUDA_HD inline std::uint32_t batch_ppu_scanline_clock_dot(const BatchBuffers& buffers) {
+    if (buffers.cart.bank_kind == kBankingMmc5) return kMmc5LineDot;
     return buffers.cart.bank_kind == kBankingJy90 ? kJyVisibleClockDot : kMmc3VisibleClockDot;
 }
 
 // Dots from frame position `current` to the next counter clock, strictly after it.
 NESLE_CUDA_HD inline std::uint32_t batch_ppu_dots_until_scanline_clock(std::uint32_t current,
                                                                        std::uint32_t visible_dot = kMmc3VisibleClockDot) {
+    if (visible_dot == kMmc5LineDot) {  // MMC5: dot 0 of lines 0-240
+        const std::uint32_t line = current / kPpuDotsPerScanline;
+        if (line < 240u) return kPpuDotsPerScanline - current % kPpuDotsPerScanline;
+        return kPpuDotsPerScanline * kPpuScanlinesPerFrame - current;  // line 0 of the next frame
+    }
     constexpr std::uint32_t kDots = kPpuDotsPerScanline;
     constexpr std::uint32_t kPreRender = static_cast<std::uint32_t>(kPpuPreRenderScanline);
     const std::uint32_t line = current / kDots;
@@ -248,6 +259,15 @@ NESLE_CUDA_HD inline void batch_ppu_clock_scanline_counter(BatchBuffers& buffers
                                                            std::uint32_t start_dot,
                                                            std::uint32_t end_dot,
                                                            const PpuHotState& hot) {
+    if (buffers.cart.bank_kind == kBankingMmc5) {
+        if ((hot.mask & 0x18) == 0) return;
+        for (std::uint32_t line_abs = start_dot / kPpuDotsPerScanline + 1u; line_abs <= end_dot / kPpuDotsPerScanline;
+             ++line_abs) {  // line starts in (start_dot, end_dot]
+            const std::uint32_t line = line_abs % kPpuScanlinesPerFrame;
+            if (line <= 240u) paged::mmc5_line(buffers, env, line);
+        }
+        return;
+    }
     if ((hot.mask & 0x18) == 0 || ((hot.ctrl & 0x38) == 0x18 && buffers.cart.bank_kind != kBankingJy90)) {
         return;
     }
@@ -533,6 +553,10 @@ NESLE_CUDA_HD inline BatchPpuStepResult batch_ppu_step_env_hot(BatchBuffers& buf
                 auto* nt_dst =
                     buffers.ppu.snap_nametable + static_cast<std::uint64_t>(env) * kNametableRamBytes;
                 copy_bytes_fast(nt_dst, nt_src, static_cast<std::uint32_t>(kNametableRamBytes));
+                if (buffers.cart.bank_kind == kBankingMmc5 && buffers.mapper.ext_ram != nullptr) {  // ExRAM too
+                    std::uint8_t* x = paged::mmc5_ext(buffers, env);
+                    copy_bytes_fast(x + kMmc5ExSnap, x + kMmc5ExRam, 0x400u);
+                }
             }
         }
         if (batch_ppu_has_sprite0_replay(buffers) && crossed(frame_offset, kReplayStatusClearDot)) {

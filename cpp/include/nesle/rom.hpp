@@ -26,6 +26,7 @@ struct RomMetadata {
     NametableArrangement nametable_arrangement = NametableArrangement::Vertical;
     std::size_t prg_rom_size = 0;
     std::size_t chr_rom_size = 0;
+    std::uint32_t crc32 = 0;  // of PRG + CHR, as FCEUmm's database keys it (set by parse_ines)
 
     [[nodiscard]] bool is_nrom() const noexcept;
     [[nodiscard]] bool is_uxrom() const noexcept;
@@ -84,6 +85,7 @@ constexpr std::uint8_t kBankKindBandai16 = 47;
 constexpr std::uint8_t kBankKindFfe = 48;
 constexpr std::uint8_t kBankKindN163 = 49;
 constexpr std::uint8_t kBankKindSunsoft4 = 50;
+constexpr std::uint8_t kBankKindMmc5 = 51;
 
 // iNES mapper numbers with a banking path. Mirrored in nesle::cuda.
 constexpr std::uint16_t kMapperNrom = 0;
@@ -111,6 +113,7 @@ struct MapperLayout {
     // stay zero for them.
     std::uint16_t prg_page_mask = 0;
     std::uint16_t chr_page_mask = 0;
+    std::uint32_t ext_ram_bytes = 0;  // per-env board memory beyond the shared arrays (MMC5), 0 = none
 };
 
 struct RomImage {

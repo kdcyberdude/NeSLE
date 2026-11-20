@@ -209,6 +209,49 @@ constexpr std::uint32_t kM83Mode = 11, kM83Bank = 12, kM83Low = 13, kM83IrqOn = 
                         kM83Not2k = 21;
 
 // Recompute the page tables and mirroring from the registers.
+// ------------------------------------------------------------------ MMC5 (old FCEUmm mmc5.c)
+// regs: [0..3] PRGBanks [4..11] CHRBanksA low [12..19] their bits 8-9 [20..23] CHRBanksB low [24..27] bits 8-9
+// [28] WRAMPage [29,30] WRAMMaskEnable [31] mmc5ABMode [32] IRQScanline [33] IRQEnable [34] CHRMode [35] NTAMirroring
+// [36] MMC5IRQR [37] MMC5LineCounter [38] mmc5psize [39] mmc5vsize [40,41] mul [42] $5130 [43] split mode
+// [44] NTFill [45] ATFill (kNtChrPage slots, so the frame log carries them) [46] split scroll [47] split page.
+constexpr std::uint32_t kM5Prg = 0, kM5ALo = 4, kM5AHi = 12, kM5BLo = 20, kM5BHi = 24, kM5WramPage = 28,
+                        kM5WramMask = 29, kM5AB = 31, kM5IrqLine = 32, kM5IrqOn = 33, kM5ChrMode = 34, kM5Nta = 35,
+                        kM5IrqStatus = 36, kM5LineCount = 37, kM5PSize = 38, kM5VSize = 39, kM5Mul = 40,
+                        kM5Hi = 42, kM5Split = 43, kM5NtFill = 44, kM5AtFill = 45;
+
+NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE std::uint8_t* mmc5_ext(const BatchBuffers& buffers, std::uint32_t env) {
+    return buffers.mapper.ext_ram + static_cast<std::uint64_t>(env) * buffers.cart.ext_ram_bytes;
+}
+
+// MMC5WRAMIndex[v & 7] for the cart's WRAM size: the 8 KB WRAM bank, or 255 (none).
+NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE std::uint32_t mmc5_wram_index(const CartridgeView& cart, std::uint32_t v) {
+    const std::uint32_t x = v & 7u;
+    switch ((cart.ext_ram_bytes - kMmc5ExWram) >> 13) {  // MMC5WRAMsize = KB / 8
+        case 1: return x > 3u ? 255u : 0u;
+        case 2: return (x & 4u) >> 2;
+        case 4: return x > 3u ? 255u : (x & 3u);
+        case 8: return x;
+        default: return 255u;
+    }
+}
+
+// The 1 KB CHR page of slot `slot` in set A (sprites) or B (background), as MMC5CHRA / MMC5CHRB map them.
+NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE std::uint32_t mmc5_chr_page(const std::uint16_t* a, const std::uint16_t* b,
+                                                                         std::uint32_t vsize, bool set_b,
+                                                                         std::uint32_t slot) {
+    switch (vsize & 3u) {
+        case 0: return (set_b ? b[3] : a[7]) * 8u + slot;
+        case 1: return (set_b ? b[3] : a[(slot >> 2) * 4u + 3u]) * 4u + (slot & 3u);
+        case 2: return (set_b ? b[((slot >> 1) & 1u) * 2u + 1u] : a[(slot >> 1) * 2u + 1u]) * 2u + (slot & 1u);
+        default: return set_b ? b[slot & 3u] : a[slot];
+    }
+}
+
+NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void mmc5_banks(const std::uint8_t* r, std::uint16_t* a, std::uint16_t* b) {
+    for (std::uint32_t i = 0; i < 8u; ++i) a[i] = static_cast<std::uint16_t>(r[kM5ALo + i] | (r[kM5AHi + i] << 8));
+    for (std::uint32_t i = 0; i < 4u; ++i) b[i] = static_cast<std::uint16_t>(r[kM5BLo + i] | (r[kM5BHi + i] << 8));
+}
+
 NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void sync(const BatchBuffers& buffers, std::uint32_t env) {
     const std::uint8_t* r = regs(buffers, env);
     switch (buffers.cart.bank_kind) {
@@ -817,6 +860,54 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void sync(const BatchBuffers& buff
                 }
             }
             break;
+        case kBankingMmc5: {  // MMC5PRG, MMC5CHRA/B (the last synced set is the CPU's view), $5105
+            const std::uint8_t* p = r + kM5Prg;
+            auto ram = [&](std::uint32_t slot, std::uint32_t v) {  // MMC5WRAM for $8000-$DFFF
+                const std::uint32_t idx = mmc5_wram_index(buffers.cart, v);
+                buffers.mapper.prg_page[static_cast<std::uint64_t>(env) * kPrgPages + slot] =
+                    idx == 255u ? kPrgPageOpen
+                                : kPrgPageRam | ((idx * 8192u) & (buffers.cart.ext_ram_bytes - kMmc5ExWram - 1u));
+            };
+            switch (r[kM5PSize] & 3u) {
+                case 0:
+                    set_prg32(buffers, env, (p[1] & 0x7Fu) >> 2);
+                    break;
+                case 1:
+                    if ((p[1] & 0x80u) != 0) {
+                        set_prg16(buffers, env, 0, p[1] >> 1);
+                    } else {
+                        ram(0, p[1] & 7u & 0xFEu);
+                        ram(1, (p[1] & 7u & 0xFEu) + 1u);
+                    }
+                    set_prg16(buffers, env, 1, (p[3] & 0x7Fu) >> 1);
+                    break;
+                case 2:
+                    if ((p[1] & 0x80u) != 0) {
+                        set_prg16(buffers, env, 0, (p[1] & 0x7Fu) >> 1);
+                    } else {
+                        ram(0, p[1] & 7u & 0xFEu);
+                        ram(1, (p[1] & 7u & 0xFEu) + 1u);
+                    }
+                    if ((p[2] & 0x80u) != 0) set_prg8(buffers, env, 2, p[2] & 0x7Fu);
+                    else ram(2, p[2] & 7u);
+                    set_prg8(buffers, env, 3, p[3] & 0x7Fu);
+                    break;
+                default:
+                    for (std::uint32_t x = 0; x < 3u; ++x) {
+                        if ((p[x] & 0x80u) != 0) set_prg8(buffers, env, x, p[x] & 0x7Fu);
+                        else ram(x, p[x] & 7u);
+                    }
+                    set_prg8(buffers, env, 3, p[3] & 0x7Fu);
+                    break;
+            }
+            std::uint16_t a[8], b[4];
+            mmc5_banks(r, a, b);
+            for (std::uint32_t i = 0; i < 8u; ++i) {
+                set_chr1(buffers, env, i, mmc5_chr_page(a, b, r[kM5VSize], r[kM5AB] != 0, i));
+            }
+            set_mirroring(buffers, env, r[kM5Nta]);  // 2 bits per quadrant: CIRAM 0/1, ExRAM, fill
+            break;
+        }
         case kBankingFme7: {
             for (std::uint32_t i = 0; i < 3u; ++i) set_prg8(buffers, env, i, r[kFmePrg + i] & 0x3Fu);
             set_prg8(buffers, env, 3, ~0u);
@@ -873,6 +964,14 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void power_on(const BatchBuffers& 
             break;
         case kBankingM243:
             r[1] = 3;
+            break;
+        case kBankingMmc5:  // GenMMC5Reset
+            for (std::uint32_t i = 0; i < 4u; ++i) r[kM5Prg + i] = 0xFF;
+            for (std::uint32_t i = 0; i < 8u; ++i) { r[kM5ALo + i] = 0xFF; r[kM5AHi + i] = 3; }
+            for (std::uint32_t i = 0; i < 4u; ++i) { r[kM5BLo + i] = 0xFF; r[kM5BHi + i] = 3; }
+            r[kM5WramMask] = r[kM5WramMask + 1] = 0xFF;
+            r[kM5PSize] = r[kM5VSize] = 3;
+            r[kM5Nta] = r[kM5NtFill] = r[kM5AtFill] = 0xFF;
             break;
         case kBankingN163:
             r[19] = r[20] = r[21] = r[22] = 0xFF;
@@ -1074,6 +1173,83 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void n163_write(BatchBuffers& buff
     sync(buffers, env);
 }
 
+// MMC5 writes: Mapper5_write ($5000-$5BFF), MMC5_ExRAMWr ($5C00-$5FFF), MMC5_WriteROMRAM ($6000-$FFFF).
+NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void mmc5_write(BatchBuffers& buffers, std::uint32_t env,
+                                                              std::uint16_t address, std::uint8_t value) {
+    std::uint8_t* r = regs(buffers, env);
+    std::uint8_t* ext = mmc5_ext(buffers, env);
+    if (address >= 0x6000u) {
+        if (((r[kM5WramMask] & 3u) | ((r[kM5WramMask + 1] & 3u) << 2)) != 6u) return;
+        std::uint32_t page;
+        if (address < 0x8000u) {
+            const std::uint32_t idx = mmc5_wram_index(buffers.cart, r[kM5WramPage]);
+            if (idx == 255u) return;
+            page = kPrgPageRam | ((idx * 8192u) & (buffers.cart.ext_ram_bytes - kMmc5ExWram - 1u));
+        } else {
+            page = buffers.mapper.prg_page[static_cast<std::uint64_t>(env) * kPrgPages + ((address >> 13) & 3u)];
+        }
+        if ((page & kPrgPageRam) != 0) ext[kMmc5ExWram + ((page & 0xFFFFFu) | (address & 0x1FFFu))] = value;
+        return;  // ROM (write-protected) or no RAM
+    }
+    if (address >= 0x5C00u) {
+        if ((r[kM5ChrMode] & 3u) != 3u) ext[kMmc5ExRam + (address & 0x3FFu)] = value;
+        return;
+    }
+    switch (address) {
+        case 0x5100u: r[kM5PSize] = value; break;
+        case 0x5101u: r[kM5VSize] = value; break;
+        case 0x5102u: r[kM5WramMask] = value; return;
+        case 0x5103u: r[kM5WramMask + 1] = value; return;
+        case 0x5104u: r[kM5ChrMode] = value; return;
+        case 0x5105u: r[kM5Nta] = value; break;
+        case 0x5106u: r[kM5NtFill] = value; return;
+        case 0x5107u: r[kM5AtFill] = value; return;
+        case 0x5113u: r[kM5WramPage] = value; return;
+        case 0x5114u: case 0x5115u: case 0x5116u: case 0x5117u: r[kM5Prg + (address & 3u)] = value; break;
+        case 0x5120u: case 0x5121u: case 0x5122u: case 0x5123u:
+        case 0x5124u: case 0x5125u: case 0x5126u: case 0x5127u:
+            r[kM5AB] = 0;
+            r[kM5ALo + (address & 7u)] = value;
+            r[kM5AHi + (address & 7u)] = static_cast<std::uint8_t>(r[kM5Hi] & 3u);
+            break;
+        case 0x5128u: case 0x5129u: case 0x512Au: case 0x512Bu:
+            r[kM5AB] = 1;
+            r[kM5BLo + (address & 3u)] = value;
+            r[kM5BHi + (address & 3u)] = static_cast<std::uint8_t>(r[kM5Hi] & 3u);
+            break;
+        case 0x5130u: r[kM5Hi] = value; return;
+        case 0x5200u: r[kM5Split] = value; return;
+        case 0x5201u: r[46] = static_cast<std::uint8_t>((value >> 3) & 0x1Fu); return;
+        case 0x5202u: r[47] = static_cast<std::uint8_t>(value & 0x3Fu); return;
+        case 0x5203u: buffers.cpu.irq_pending[env] = 0; r[kM5IrqLine] = value; return;
+        case 0x5204u: buffers.cpu.irq_pending[env] = 0; r[kM5IrqOn] = static_cast<std::uint8_t>(value & 0x80u); return;
+        case 0x5205u: r[kM5Mul] = value; return;
+        case 0x5206u: r[kM5Mul + 1] = value; return;
+        default: return;  // $5000-$5015 sound and the rest
+    }
+    sync(buffers, env);
+}
+
+// MMC5_hb(scanline): at the start of visible lines 0-239 and after line 239, while rendering is on.
+NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void mmc5_line(BatchBuffers& buffers, std::uint32_t env,
+                                                             std::uint32_t scanline) {
+    std::uint8_t* r = regs(buffers, env);
+    if (scanline + 1u >= 241u) {
+        r[kM5IrqStatus] = static_cast<std::uint8_t>(r[kM5IrqStatus] & ~0xC0u);
+        r[kM5LineCount] = 0;
+        buffers.cpu.irq_pending[env] = 0;
+        return;
+    }
+    if ((r[kM5IrqStatus] & 0x40u) == 0) {
+        r[kM5IrqStatus] = static_cast<std::uint8_t>((r[kM5IrqStatus] | 0x40u) & ~0x80u);
+        r[kM5LineCount] = 0;
+        buffers.cpu.irq_pending[env] = 0;
+    } else if (++r[kM5LineCount] == r[kM5IrqLine]) {
+        r[kM5IrqStatus] = static_cast<std::uint8_t>(r[kM5IrqStatus] | 0x80u);
+        if ((r[kM5IrqOn] & 0x80u) != 0) buffers.cpu.irq_pending[env] = 1;
+    }
+}
+
 NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void write(BatchBuffers& buffers,
                                                          std::uint32_t env,
                                                          std::uint16_t address,
@@ -1149,6 +1325,9 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void write(BatchBuffers& buffers,
             return;
         } else if (kind == kBankingN163) {
             n163_write(buffers, env, address, value);
+            return;
+        } else if (kind == kBankingMmc5) {
+            mmc5_write(buffers, env, address, value);
             return;
         } else if (kind == kBankingFfe) {
             if (address == 0x42FEu || address == 0x42FFu) {  // FFEWriteMirr
@@ -1422,6 +1601,9 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void write(BatchBuffers& buffers,
             return;
         case kBankingN163:
             n163_write(buffers, env, address, value);
+            return;
+        case kBankingMmc5:
+            mmc5_write(buffers, env, address, value);
             return;
         case kBankingSunsoft4: {
             switch (address & 0xF000u) {
@@ -1982,6 +2164,14 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE bool read_6000_rom(const BatchBuff
         out = 0;
         return true;
     }
+    if (buffers.cart.bank_kind == kBankingMmc5) {  // MMC5_ReadROMRAM at $6000: WRAMPage's bank, else X.DB
+        const std::uint32_t idx = mmc5_wram_index(buffers.cart, regs(buffers, env)[kM5WramPage]);
+        out = idx == 255u ? static_cast<std::uint8_t>(address >> 8)
+                          : mmc5_ext(buffers, env)[kMmc5ExWram + (((idx * 8192u) & (buffers.cart.ext_ram_bytes -
+                                                                                         kMmc5ExWram - 1u)) |
+                                                                  (address & 0x1FFFu))];
+        return true;
+    }
     if (buffers.cart.bank_kind == kBankingBandai16) {  // BandaiRead: open bus with the EEPROM's data out in bit 4
         out = static_cast<std::uint8_t>(((address >> 8) & 0xEFu) | (regs(buffers, env)[21] << 4));
         return true;
@@ -2004,6 +2194,22 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE bool read_6000_rom(const BatchBuff
 // $4020-$5FFF reads the board answers. Returns true and the byte when it does.
 NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE bool read_expansion(const BatchBuffers& buffers, std::uint32_t env,
                                                                   std::uint16_t address, std::uint8_t& out) {
+    if (buffers.cart.bank_kind == kBankingMmc5 && address >= 0x5000u) {  // MMC5_read, MMC5_ExRAMRd
+        std::uint8_t* r = regs(buffers, env);
+        if (address >= 0x5C00u) {
+            out = mmc5_ext(buffers, env)[kMmc5ExRam + (address & 0x3FFu)];
+        } else if (address == 0x5204u) {
+            buffers.cpu.irq_pending[env] = 0;
+            out = r[kM5IrqStatus];
+            r[kM5IrqStatus] = static_cast<std::uint8_t>(r[kM5IrqStatus] & 0x40u);
+        } else if (address == 0x5205u || address == 0x5206u) {
+            const std::uint32_t product = static_cast<std::uint32_t>(r[kM5Mul]) * r[kM5Mul + 1];
+            out = static_cast<std::uint8_t>(address == 0x5205u ? product : product >> 8);
+        } else {
+            out = static_cast<std::uint8_t>(address >> 8);  // X.DB
+        }
+        return true;
+    }
     if (buffers.cart.bank_kind == kBankingN163 && address >= 0x4800u) {
         std::uint8_t* r = regs(buffers, env);
         if (address < 0x5000u) {  // Namco_Read4800: the 128-byte sound RAM is not kept; reads 0, still steps
@@ -2138,7 +2344,8 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE bool prg_ram_enabled(const BatchBu
     if (buffers.cart.bank_kind == kBankingFme7) return (regs(buffers, env)[kFmePrg6] & 0xC0u) == 0xC0u;
     if (buffers.cart.bank_kind == kBankingJy90 || buffers.cart.bank_kind == kBankingSa72008 ||
         buffers.cart.bank_kind == kBankingM243 || buffers.cart.bank_kind == kBankingCprom ||
-        buffers.cart.bank_kind == kBankingBandai16) {  // 16: prg_ram holds the EEPROM, not CPU-visible
+        buffers.cart.bank_kind == kBankingBandai16 ||  // 16: prg_ram holds the EEPROM, not CPU-visible
+        buffers.cart.bank_kind == kBankingMmc5) {      // 5: WRAM is in ext_ram
         return false;  // no RAM: ROM (read_6000_rom) or open bus
     }
     if (buffers.cart.mapper == 187 || buffers.cart.mapper == 119 || buffers.cart.mapper == 114 ||
@@ -2222,6 +2429,11 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE std::uint8_t read_prg(const BatchB
                 const std::uint32_t page =
                     buffers.mapper.prg_page[static_cast<std::uint64_t>(env) * kPrgPages +
                                             ((address >> 13) & 3u)];
+                if ((page & (kPrgPageRam | kPrgPageOpen)) != 0) {  // MMC5 WRAM in $8000-$DFFF, or nothing there
+                    if ((page & kPrgPageOpen) != 0) return static_cast<std::uint8_t>(address >> 8);
+                    return buffers.mapper.ext_ram[static_cast<std::uint64_t>(env) * cart.ext_ram_bytes + kMmc5ExWram +
+                                                  ((page & 0xFFFFFu) | (address & 0x1FFFu))];
+                }
                 return cart.prg_rom[page + (address & 0x1FFFu)];
             }
         }
