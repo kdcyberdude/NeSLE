@@ -135,6 +135,16 @@ MapperLayout describe_mapper(const RomMetadata& metadata) noexcept {
             break;
 
         case 34:
+            if (metadata.chr_rom_size != 0) {  // NINA-001 (FCEUmm 34.c): paged, registers at $7FFD-$7FFF
+                layout.bank_kind = kBankKindNina001;
+                layout.prg_page_mask = static_cast<std::uint16_t>(metadata.prg_rom_size / 0x2000 - 1);
+                layout.chr_page_mask = static_cast<std::uint16_t>(metadata.chr_rom_size / 0x400 - 1);
+                layout.supported = metadata.prg_rom_size >= 0x8000 && metadata.prg_rom_size <= 512u * 1024u &&
+                                   page_count_is_power_of_two(metadata.prg_rom_size, 0x2000) &&
+                                   metadata.chr_rom_size <= 256u * 1024u &&
+                                   page_count_is_power_of_two(metadata.chr_rom_size, 0x2000);
+                break;
+            }
             // BNROM: one 32 KB window over the whole CPU space, CHR RAM.
             // NINA-001 is the other board behind mapper 34; it needs its own
             // window layout and is deliberately not supported here.
@@ -151,26 +161,67 @@ MapperLayout describe_mapper(const RomMetadata& metadata) noexcept {
         case 1:   // MMC1 (SxROM)
         case 3:   // CNROM
         case 4:   // MMC3 (TxROM)
+        case 118: // MMC3, nametables from CHR bit 7 (TxSROM)
+        case 189: // MMC3, 32 KB PRG from $4120-$7FFF
+        case 245: // Waixing MMC3 with CHR RAM
         case 9: { // MMC2 (PxROM)
             // Paged boards: no window; the bus goes through per-env page tables.
             layout.bank_kind = metadata.mapper == 1   ? kBankKindMmc1
                                : metadata.mapper == 3 ? kBankKindCnrom
-                               : metadata.mapper == 4 ? kBankKindMmc3
-                                                      : kBankKindMmc2;
+                               : metadata.mapper == 9 ? kBankKindMmc2
+                                                      : kBankKindMmc3;
             layout.bus_conflicts = metadata.mapper == 3 && declared_conflicts;
             const std::size_t chr_bytes =
                 metadata.chr_rom_size == 0 ? std::size_t{8 * 1024} : metadata.chr_rom_size;
-            const bool prg_ok = metadata.prg_rom_size >= (metadata.mapper == 3 ? 0x4000u : 0x8000u) &&
+            const bool prg_ok = metadata.prg_rom_size >= 0x4000u &&
                                 metadata.prg_rom_size <= 512u * 1024u &&
                                 page_count_is_power_of_two(metadata.prg_rom_size, 0x2000);
             const bool chr_ok = chr_bytes <= 256u * 1024u &&
                                 page_count_is_power_of_two(chr_bytes, 0x2000);
             // CNROM and MMC2 have no CHR RAM variant that FCEUmm drives this way.
             const bool chr_kind_ok =
-                metadata.chr_rom_size != 0 || metadata.mapper == 1 || metadata.mapper == 4;
+                metadata.chr_rom_size != 0 || metadata.mapper == 1 || layout.bank_kind == kBankKindMmc3;
             layout.prg_page_mask = static_cast<std::uint16_t>(metadata.prg_rom_size / 0x2000 - 1);
             layout.chr_page_mask = static_cast<std::uint16_t>(chr_bytes / 0x400 - 1);
             layout.supported = prg_ok && chr_ok && chr_kind_ok;
+            break;
+        }
+
+        case 15: case 32: case 88:
+        case 24: case 26: case 40: case 232:
+        case 21: case 22: case 23: case 25: case 69:
+        case 7: case 11: case 66: case 71: case 79: case 113: case 140: case 38: case 87: {
+            // Latch boards: paged like CNROM. CHR RAM only where the board has it (7, 71; FCEUmm allows it on all).
+            switch (metadata.mapper) {
+                case 7: layout.bank_kind = kBankKindAxrom; break;
+                case 11: layout.bank_kind = kBankKindColorDreams; break;
+                case 66: layout.bank_kind = kBankKindGxrom; break;
+                case 71: layout.bank_kind = kBankKindCamerica; break;
+                case 79: layout.bank_kind = kBankKindNina0306; break;
+                case 113: layout.bank_kind = kBankKindHes; break;
+                case 140: layout.bank_kind = kBankKindJaleco140; break;
+                case 21: layout.bank_kind = kBankKindVrc21; break;
+                case 22: layout.bank_kind = kBankKindVrc22; break;
+                case 23: layout.bank_kind = kBankKindVrc23; break;
+                case 25: layout.bank_kind = kBankKindVrc25; break;
+                case 69: layout.bank_kind = kBankKindFme7; break;
+                case 24: layout.bank_kind = kBankKindVrc6a; break;
+                case 26: layout.bank_kind = kBankKindVrc6b; break;
+                case 40: layout.bank_kind = kBankKindSmb2j40; break;
+                case 232: layout.bank_kind = kBankKindQuattro; break;
+                case 15: layout.bank_kind = kBankKindM15; break;
+                case 32: layout.bank_kind = kBankKindIrem32; break;
+                case 88: layout.bank_kind = kBankKindNamco88; break;
+                case 38: layout.bank_kind = kBankKindBitCorp38; break;
+                default: layout.bank_kind = kBankKindJaleco87; break;
+            }
+            const std::size_t chr_bytes =
+                metadata.chr_rom_size == 0 ? std::size_t{8 * 1024} : metadata.chr_rom_size;
+            layout.prg_page_mask = static_cast<std::uint16_t>(metadata.prg_rom_size / 0x2000 - 1);
+            layout.chr_page_mask = static_cast<std::uint16_t>(chr_bytes / 0x400 - 1);
+            layout.supported = metadata.prg_rom_size >= 0x4000 && metadata.prg_rom_size <= 512u * 1024u &&
+                               page_count_is_power_of_two(metadata.prg_rom_size, 0x2000) &&
+                               chr_bytes <= 256u * 1024u && page_count_is_power_of_two(chr_bytes, 0x2000);
             break;
         }
 
@@ -262,8 +313,12 @@ RomImage parse_ines(std::span<const std::uint8_t> bytes) {
     const auto prg_banks = bytes[4];
     const auto chr_banks = bytes[5];
     const auto flags6 = bytes[6];
-    const auto flags7 = bytes[7];
-    const bool is_nes2 = (flags7 & 0x0C) == 0x08;
+    // Old dumping tools wrote text ("DiskDude!", "Ni03") into bytes 7-15. As FCEUX does, an iNES 1.0 header whose
+    // bytes 12-15 are not zero has a garbage flags 7, so its mapper high nibble is ignored.
+    const bool nes2_bits = (bytes[7] & 0x0C) == 0x08;
+    const bool dirty = !nes2_bits && (bytes[12] | bytes[13] | bytes[14] | bytes[15]) != 0;
+    const auto flags7 = dirty ? std::uint8_t{0} : bytes[7];
+    const bool is_nes2 = nes2_bits;
     if (is_nes2 && bytes[9] != 0) {
         throw std::invalid_argument("NES 2.0 extended PRG/CHR ROM sizes are not supported yet");
     }
@@ -305,8 +360,15 @@ RomImage parse_ines(std::span<const std::uint8_t> bytes) {
     }
 
     const std::size_t required = offset + metadata.prg_rom_size + metadata.chr_rom_size;
-    if (bytes.size() < required) {
+    // A file shorter than its header declares (a short last bank) loads as in FCEUX: the missing bytes read as 0.
+    if (bytes.size() < offset + 0x10) {
         throw std::invalid_argument("iNES data is truncated for declared PRG/CHR sizes");
+    }
+    std::vector<std::uint8_t> padded;
+    if (bytes.size() < required) {
+        padded.assign(bytes.begin(), bytes.end());
+        padded.resize(required, 0);
+        bytes = std::span<const std::uint8_t>(padded);
     }
 
     RomImage image;
@@ -316,6 +378,19 @@ RomImage parse_ines(std::span<const std::uint8_t> bytes) {
     offset += metadata.prg_rom_size;
     image.chr_rom.assign(bytes.begin() + static_cast<std::ptrdiff_t>(offset),
                          bytes.begin() + static_cast<std::ptrdiff_t>(offset + metadata.chr_rom_size));
+    // Banked boards: as FCEUX does, an image whose PRG or CHR is not a power of two (PlayChoice dumps carry an 8 KB
+    // INST-ROM after the CHR, some hacks grew the CHR) is padded with $FF up to one, so bank masks wrap cleanly.
+    if (metadata.mapper != 0) {
+        auto pow2 = [](std::size_t n) { std::size_t p = 1; while (p < n) p <<= 1; return p; };
+        if (!image.prg_rom.empty() && pow2(image.prg_rom.size()) != image.prg_rom.size()) {
+            image.prg_rom.resize(pow2(image.prg_rom.size()), 0xFF);
+            image.metadata.prg_rom_size = image.prg_rom.size();
+        }
+        if (!image.chr_rom.empty() && pow2(image.chr_rom.size()) != image.chr_rom.size()) {
+            image.chr_rom.resize(pow2(image.chr_rom.size()), 0xFF);
+            image.metadata.chr_rom_size = image.chr_rom.size();
+        }
+    }
     return image;
 }
 

@@ -87,12 +87,30 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE bool cart_is_paged(const Cartridge
 
 namespace paged {
 
+// VRC2/4: [0] PRG 0 [1] PRG 1 [2] mirroring [3] PRG swap [4..19] CHR 0-7 (lo, hi byte) [20] IRQ latch
+//         [21] IRQ control [22] IRQ counter [23,24] prescaler (int16, little endian)
+// FME-7:  [0] command [1..8] CHR 0-7 [9] $6000 bank [10..12] PRG $8000/$A000/$C000 [13] mirroring
+//         [14] IRQ control [15,16] IRQ counter (little endian)
+constexpr std::uint32_t kVrcPrg0 = 0, kVrcPrg1 = 1, kVrcMirror = 2, kVrcSwap = 3, kVrcChr = 4, kVrcIrqLatch = 20,
+                        kVrcIrqControl = 21, kVrcIrqCounter = 22, kVrcPrescaler = 23;
+constexpr std::uint32_t kFmeCommand = 0, kFmeChr = 1, kFmePrg6 = 9, kFmePrg = 10, kFmeMirror = 13, kFmeIrqControl = 14,
+                        kFmeIrqCounter = 15;
+
+// VRC6: [0] PRG 16 KB [1] PRG 8 KB [2] control ($B003) [4..11] CHR 0-7 [20..24] IRQ as VRC4
+// 40:   [0] $C000 bank [1] IRQ enabled [2,3] IRQ cycle count (little endian)
+// 232:  [0] outer block [1] inner bank
+constexpr std::uint32_t kVrc6Prg16 = 0, kVrc6Prg8 = 1, kVrc6Control = 2;
+
+NESLE_CUDA_MAPPER_HD constexpr bool kind_is_vrc(std::uint8_t kind) {  // boards with the VRC4/VRC6 IRQ
+    return (kind >= kBankingVrc21 && kind <= kBankingVrc25) || kind == kBankingVrc6a || kind == kBankingVrc6b;
+}
+
 constexpr std::uint32_t kMmc1Control = 0, kMmc1Chr0 = 1, kMmc1Chr1 = 2, kMmc1Prg = 3,
                         kMmc1Shift = 4, kMmc1ShiftCount = 5;
 constexpr std::uint32_t kMmc2Prg = 4, kMmc2Mirroring = 5, kMmc2Latch0 = 6, kMmc2Latch1 = 7;
 constexpr std::uint32_t kMmc3BankSelect = 8, kMmc3Mirroring = 9, kMmc3PrgRam = 10,
                         kMmc3IrqLatch = 11, kMmc3IrqCounter = 12, kMmc3IrqEnabled = 13,
-                        kMmc3IrqReload = 14;
+                        kMmc3IrqReload = 14, kMmc3Outer = 15;  // [15]: 189's 32 KB PRG register
 
 NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE std::uint8_t* regs(const BatchBuffers& buffers,
                                                                  std::uint32_t env) {
@@ -131,6 +149,22 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void set_chr4(const BatchBuffers& 
                                                             std::uint32_t bank) {
     for (std::uint32_t i = 0; i < 4u; ++i) {
         set_chr1(buffers, env, slot4 * 4u + i, bank * 4u + i);
+    }
+}
+
+NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void set_prg32(const BatchBuffers& buffers,
+                                                             std::uint32_t env,
+                                                             std::uint32_t bank) {
+    for (std::uint32_t i = 0; i < 4u; ++i) {
+        set_prg8(buffers, env, i, bank * 4u + i);
+    }
+}
+
+NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void set_chr8(const BatchBuffers& buffers,
+                                                            std::uint32_t env,
+                                                            std::uint32_t bank) {
+    for (std::uint32_t i = 0; i < 8u; ++i) {
+        set_chr1(buffers, env, i, bank * 8u + i);
     }
 }
 
@@ -223,6 +257,7 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void sync(const BatchBuffers& buff
             }
             set_prg8(buffers, env, 1, r[7] & 0x7Fu);
             set_prg8(buffers, env, 3, 0x7Fu);
+            if (buffers.cart.mapper == 189) set_prg32(buffers, env, r[kMmc3Outer] & 7u);  // M189PW: 32 KB from $4120
             // CHR: 2 KB banks R0/R1 and 1 KB banks R2-R5; bit 7 swaps the halves.
             const std::uint32_t flip = (select & 0x80u) != 0 ? 4u : 0u;
             set_chr1(buffers, env, 0u ^ flip, r[0] & 0xFEu);
@@ -233,8 +268,174 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void sync(const BatchBuffers& buff
             set_chr1(buffers, env, 5u ^ flip, r[3]);
             set_chr1(buffers, env, 6u ^ flip, r[4]);
             set_chr1(buffers, env, 7u ^ flip, r[5]);
+            if (buffers.cart.mapper == 118) {
+                // TxSROM: CHR A17 (bit 7) of the bank in each 1 KB of $0000-$0FFF drives CIRAM A10 for the
+                // nametable at the same index; the bit is not a CHR address line.
+                const std::uint32_t lo[4] = {r[0] & 0xFEu, r[0] | 1u, r[1] & 0xFEu, r[1] | 1u};
+                const std::uint32_t hi[4] = {r[2], r[3], r[4], r[5]};
+                std::uint8_t map = 0;
+                for (std::uint32_t q = 0; q < 4u; ++q) {
+                    map |= static_cast<std::uint8_t>((((flip ? hi[q] : lo[q]) >> 7) & 1u) << q);
+                }
+                for (std::uint32_t slot = 0; slot < 8u; ++slot) {
+                    const std::uint32_t bank = slot < 4u ? lo[slot] : hi[slot - 4u];
+                    set_chr1(buffers, env, slot ^ flip, bank & 0x7Fu);
+                }
+                set_mirroring(buffers, env, map);
+                break;
+            }
             set_mirroring(buffers, env,
                           (r[kMmc3Mirroring] & 1u) != 0 ? kPageMapHorizontal : kPageMapVertical);
+            break;
+        }
+        // ---- latch boards: r[0] = latch, r[1] = one-screen page (Camerica)
+        case kBankingAxrom:
+            set_prg32(buffers, env, r[0] & 0x0Fu);
+            set_chr8(buffers, env, 0);
+            set_mirroring(buffers, env, (r[0] & 0x10u) != 0 ? kPageMapSingleHigh : kPageMapSingleLow);
+            break;
+        case kBankingColorDreams:
+            set_prg32(buffers, env, r[0] & 0x0Fu);
+            set_chr8(buffers, env, r[0] >> 4);
+            break;
+        case kBankingGxrom:
+            set_prg32(buffers, env, (r[0] >> 4) & 0x0Fu);
+            set_chr8(buffers, env, r[0] & 0x0Fu);
+            break;
+        case kBankingCamerica:
+            set_prg16(buffers, env, 0, r[0]);
+            set_prg16(buffers, env, 1, 0xFFu);
+            set_chr8(buffers, env, 0);
+            if (r[2] != 0) {  // only once the game wrote $9000 (BF9097): else the header's mirroring
+                set_mirroring(buffers, env, r[1] != 0 ? kPageMapSingleHigh : kPageMapSingleLow);
+            }
+            break;
+        case kBankingNina0306:
+            set_prg32(buffers, env, (r[0] >> 3) & 1u);
+            set_chr8(buffers, env, r[0] & 7u);
+            break;
+        case kBankingHes:
+            set_prg32(buffers, env, (r[0] >> 3) & 7u);
+            set_chr8(buffers, env, ((r[0] >> 3) & 8u) | (r[0] & 7u));
+            set_mirroring(buffers, env, (r[0] & 0x80u) != 0 ? kPageMapVertical : kPageMapHorizontal);
+            break;
+        case kBankingJaleco140:
+            set_prg32(buffers, env, (r[0] >> 4) & 3u);
+            set_chr8(buffers, env, r[0] & 0x0Fu);
+            break;
+        case kBankingBitCorp38:
+            set_prg32(buffers, env, r[0] & 3u);
+            set_chr8(buffers, env, (r[0] >> 2) & 3u);
+            break;
+        case kBankingJaleco87:
+            set_prg32(buffers, env, 0);
+            set_chr8(buffers, env, ((r[0] >> 1) & 1u) | ((r[0] << 1) & 2u));
+            break;
+        case kBankingVrc21: case kBankingVrc22: case kBankingVrc23: case kBankingVrc25: {
+            if ((r[kVrcSwap] & 2u) != 0) {
+                set_prg8(buffers, env, 0, ~1u);
+                set_prg8(buffers, env, 2, r[kVrcPrg0]);
+            } else {
+                set_prg8(buffers, env, 0, r[kVrcPrg0]);
+                set_prg8(buffers, env, 2, ~1u);
+            }
+            set_prg8(buffers, env, 1, r[kVrcPrg1]);
+            set_prg8(buffers, env, 3, ~0u);
+            for (std::uint32_t i = 0; i < 8u; ++i) {
+                std::uint32_t bank = r[kVrcChr + 2u * i] | (static_cast<std::uint32_t>(r[kVrcChr + 2u * i + 1u]) << 4);
+                if (buffers.cart.bank_kind == kBankingVrc22) bank >>= 1;
+                set_chr1(buffers, env, i, bank);
+            }
+            switch (r[kVrcMirror] & (buffers.cart.bank_kind == kBankingVrc22 ? 1u : 3u)) {
+                case 0: set_mirroring(buffers, env, kPageMapVertical); break;
+                case 1: set_mirroring(buffers, env, kPageMapHorizontal); break;
+                case 2: set_mirroring(buffers, env, kPageMapSingleLow); break;
+                default: set_mirroring(buffers, env, kPageMapSingleHigh); break;
+            }
+            break;
+        }
+        case kBankingVrc6a: case kBankingVrc6b:
+            set_prg16(buffers, env, 0, r[kVrc6Prg16]);
+            set_prg8(buffers, env, 2, r[kVrc6Prg8]);
+            set_prg8(buffers, env, 3, ~0u);
+            for (std::uint32_t i = 0; i < 8u; ++i) set_chr1(buffers, env, i, r[4u + i]);
+            switch ((r[kVrc6Control] >> 2) & 3u) {
+                case 0: set_mirroring(buffers, env, kPageMapVertical); break;
+                case 1: set_mirroring(buffers, env, kPageMapHorizontal); break;
+                case 2: set_mirroring(buffers, env, kPageMapSingleLow); break;
+                default: set_mirroring(buffers, env, kPageMapSingleHigh); break;
+            }
+            break;
+        case kBankingSmb2j40:
+            set_prg8(buffers, env, 0, 4);
+            set_prg8(buffers, env, 1, 5);
+            set_prg8(buffers, env, 2, r[0] & 7u);
+            set_prg8(buffers, env, 3, 7);
+            set_chr8(buffers, env, 0);
+            break;
+        case kBankingQuattro:
+            set_prg16(buffers, env, 0, (r[0] & 0x0Cu) | (r[1] & 3u));
+            set_prg16(buffers, env, 1, (r[0] & 0x0Cu) | 3u);
+            set_chr8(buffers, env, 0);
+            break;
+        case kBankingNina001:
+            set_prg32(buffers, env, r[0]);
+            set_chr4(buffers, env, 0, r[1]);
+            set_chr4(buffers, env, 1, r[2]);
+            break;
+        case kBankingM15: {  // r[0] data, r[1] address bits 0-1
+            const std::uint32_t bank = (r[0] & 0x3Fu) << 1;
+            switch (r[1] & 3u) {
+                case 0:
+                    for (std::uint32_t i = 0; i < 4u; ++i) set_prg8(buffers, env, i, bank + i);
+                    break;
+                case 2:
+                    for (std::uint32_t i = 0; i < 4u; ++i) set_prg8(buffers, env, i, bank | (r[0] >> 7));
+                    break;
+                default: {
+                    const std::uint32_t hi = (r[1] & 2u) == 0 ? (bank | 0x0Eu) : bank;
+                    set_prg8(buffers, env, 0, bank);
+                    set_prg8(buffers, env, 1, bank + 1u);
+                    set_prg8(buffers, env, 2, hi);
+                    set_prg8(buffers, env, 3, hi + 1u);
+                    break;
+                }
+            }
+            set_chr8(buffers, env, 0);
+            set_mirroring(buffers, env, (r[0] & 0x40u) != 0 ? kPageMapHorizontal : kPageMapVertical);
+            break;
+        }
+        case kBankingIrem32: {  // [0] PRG 0 [1] mirroring/swap [2] PRG 1 [3..10] CHR
+            const bool swap = (r[1] & 2u) != 0;
+            set_prg8(buffers, env, swap ? 2u : 0u, r[0]);
+            set_prg8(buffers, env, 1, r[2]);
+            set_prg8(buffers, env, swap ? 0u : 2u, ~1u);
+            set_prg8(buffers, env, 3, ~0u);
+            for (std::uint32_t i = 0; i < 8u; ++i) set_chr1(buffers, env, i, r[3u + i]);
+            set_mirroring(buffers, env, (r[1] & 1u) != 0 ? kPageMapHorizontal : kPageMapVertical);
+            break;
+        }
+        case kBankingNamco88:  // [0..7] R0-R7 [8] command
+            set_chr1(buffers, env, 0, r[0] & 0xFEu);
+            set_chr1(buffers, env, 1, r[0] | 1u);
+            set_chr1(buffers, env, 2, r[1] & 0xFEu);
+            set_chr1(buffers, env, 3, r[1] | 1u);
+            for (std::uint32_t i = 0; i < 4u; ++i) set_chr1(buffers, env, 4u + i, r[2u + i] | 0x40u);
+            set_prg8(buffers, env, 0, r[6]);
+            set_prg8(buffers, env, 1, r[7]);
+            set_prg8(buffers, env, 2, ~1u);
+            set_prg8(buffers, env, 3, ~0u);
+            break;
+        case kBankingFme7: {
+            for (std::uint32_t i = 0; i < 3u; ++i) set_prg8(buffers, env, i, r[kFmePrg + i] & 0x3Fu);
+            set_prg8(buffers, env, 3, ~0u);
+            for (std::uint32_t i = 0; i < 8u; ++i) set_chr1(buffers, env, i, r[kFmeChr + i]);
+            switch (r[kFmeMirror] & 3u) {
+                case 0: set_mirroring(buffers, env, kPageMapVertical); break;
+                case 1: set_mirroring(buffers, env, kPageMapHorizontal); break;
+                case 2: set_mirroring(buffers, env, kPageMapSingleLow); break;
+                default: set_mirroring(buffers, env, kPageMapSingleHigh); break;
+            }
             break;
         }
         default:
@@ -256,6 +457,21 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void power_on(const BatchBuffers& 
         case kBankingMmc2:
             r[kMmc2Latch0] = 1;
             r[kMmc2Latch1] = 1;
+            break;
+        case kBankingVrc21: case kBankingVrc22: case kBankingVrc23: case kBankingVrc25:
+            r[kVrcPrg1] = 1;
+            r[kVrcMirror] = buffers.cart.nametable_arrangement == kNametableHorizontal ? 1u : 0u;
+            break;
+        case kBankingVrc6a: case kBankingVrc6b:
+            r[kVrc6Control] = buffers.cart.nametable_arrangement == kNametableHorizontal ? 4u : 0u;
+            break;
+        case kBankingNina001:
+            r[2] = 1;
+            break;
+        case kBankingFme7:
+            r[kFmePrg + 1] = 1;
+            r[kFmePrg + 2] = 2;
+            r[kFmeMirror] = buffers.cart.nametable_arrangement == kNametableHorizontal ? 1u : 0u;
             break;
         case kBankingMmc3:
             r[1] = 2;
@@ -296,7 +512,187 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void write(BatchBuffers& buffers,
                                                          std::uint8_t value,
                                                          std::uint8_t rom_byte) {
     std::uint8_t* r = regs(buffers, env);
-    switch (buffers.cart.bank_kind) {
+    const std::uint8_t kind = buffers.cart.bank_kind;
+    if (address < 0x8000u) {
+        // $4020-$7FFF: only the boards with a register there respond.
+        if (kind == kBankingNina0306 || kind == kBankingHes) {
+            if (address >= 0x6000u || (address & 0x0100u) == 0) return;
+        } else if (kind == kBankingJaleco140 || kind == kBankingJaleco87) {
+            if (address < 0x6000u) return;
+        } else if (kind == kBankingBitCorp38) {
+            if (address < 0x7000u) return;
+        } else if (kind == kBankingNina001) {
+            if (address < 0x7FFDu) return;
+            r[address - 0x7FFDu] = value;
+            sync(buffers, env);
+            return;
+        } else if (kind == kBankingMmc3 && buffers.cart.mapper == 189) {
+            if (address < 0x4120u) return;
+            r[kMmc3Outer] = static_cast<std::uint8_t>(value | (value >> 4));
+            sync(buffers, env);
+            return;
+        } else {
+            return;
+        }
+        r[0] = value;
+        sync(buffers, env);
+        return;
+    }
+    switch (kind) {
+        case kBankingNina0306: case kBankingHes: case kBankingJaleco140: case kBankingBitCorp38:
+        case kBankingJaleco87:
+            return;  // no register at $8000-$FFFF
+        case kBankingAxrom: case kBankingColorDreams: case kBankingGxrom:
+            r[0] = value;
+            break;
+        case kBankingVrc21: case kBankingVrc22: case kBankingVrc23: case kBankingVrc25: {
+            std::uint32_t sel;
+            switch (kind) {
+                case kBankingVrc21: sel = ((address >> 1) & 3u) | ((address >> 6) & 3u); break;
+                case kBankingVrc22: sel = ((address >> 1) & 1u) | ((address << 1) & 2u); break;
+                case kBankingVrc23: sel = (address & 3u) | ((address >> 2) & 3u); break;
+                default:
+                    sel = ((address >> 1) & 1u) | ((address << 1) & 2u) | ((address >> 3) & 1u) | ((address >> 1) & 2u);
+                    break;
+            }
+            const std::uint32_t page = address & 0xF000u;
+            if (page == 0x8000u) {
+                r[kVrcPrg0] = static_cast<std::uint8_t>(value & 0x1Fu);
+            } else if (page == 0xA000u) {
+                r[kVrcPrg1] = static_cast<std::uint8_t>(value & 0x1Fu);
+            } else if (page == 0x9000u) {
+                if (kind == kBankingVrc22 || sel < 2u) {
+                    r[kVrcMirror] = value;
+                } else {
+                    r[kVrcSwap] = value;
+                }
+            } else if (page >= 0xB000u && page <= 0xE000u) {
+                const std::uint32_t bank = ((page - 0xB000u) >> 12) * 2u + (sel >> 1);
+                r[kVrcChr + 2u * bank + (sel & 1u)] = static_cast<std::uint8_t>(value & (sel & 1u ? 0x1Fu : 0x0Fu));
+            } else {  // $F000: IRQ
+                switch (sel) {
+                    case 0: r[kVrcIrqLatch] = static_cast<std::uint8_t>((r[kVrcIrqLatch] & 0xF0u) | (value & 0x0Fu)); return;
+                    case 1: r[kVrcIrqLatch] = static_cast<std::uint8_t>((r[kVrcIrqLatch] & 0x0Fu) | (value << 4)); return;
+                    case 2:
+                        r[kVrcIrqControl] = static_cast<std::uint8_t>(value & 7u);
+                        if ((value & 2u) != 0) {
+                            r[kVrcIrqCounter] = r[kVrcIrqLatch];
+                            r[kVrcPrescaler] = 341 & 0xFF;
+                            r[kVrcPrescaler + 1] = 341 >> 8;
+                        }
+                        buffers.cpu.irq_pending[env] = 0;
+                        return;
+                    default:
+                        // ack: enabled = enable-after-ack bit
+                        r[kVrcIrqControl] = static_cast<std::uint8_t>((r[kVrcIrqControl] & ~2u) |
+                                                                      ((r[kVrcIrqControl] & 1u) << 1));
+                        buffers.cpu.irq_pending[env] = 0;
+                        return;
+                }
+            }
+            break;
+        }
+        case kBankingVrc6a: case kBankingVrc6b: {
+            const std::uint32_t sel = kind == kBankingVrc6a ? (address & 3u)
+                                                            : (((address & 1u) << 1) | ((address >> 1) & 1u));
+            switch (address & 0xF000u) {
+                case 0x8000u: r[kVrc6Prg16] = value; break;
+                case 0xC000u: r[kVrc6Prg8] = value; break;
+                case 0xB000u:
+                    if (sel != 3u) return;  // $B000-$B002: sound
+                    r[kVrc6Control] = value;
+                    break;
+                case 0xD000u: r[4u + sel] = value; break;
+                case 0xE000u: r[8u + sel] = value; break;
+                case 0xF000u:
+                    if (sel == 0u) {
+                        r[kVrcIrqLatch] = value;
+                    } else if (sel == 1u) {
+                        r[kVrcIrqControl] = static_cast<std::uint8_t>(value & 7u);
+                        if ((value & 2u) != 0) {
+                            r[kVrcIrqCounter] = r[kVrcIrqLatch];
+                            r[kVrcPrescaler] = 341 & 0xFF;
+                            r[kVrcPrescaler + 1] = 341 >> 8;
+                        }
+                        buffers.cpu.irq_pending[env] = 0;
+                    } else if (sel == 2u) {
+                        r[kVrcIrqControl] = static_cast<std::uint8_t>((r[kVrcIrqControl] & ~2u) |
+                                                                      ((r[kVrcIrqControl] & 1u) << 1));
+                        buffers.cpu.irq_pending[env] = 0;
+                    }
+                    return;
+                default: return;  // $9000-$AFFF: sound
+            }
+            break;
+        }
+        case kBankingSmb2j40:
+            switch (address & 0xE000u) {
+                case 0x8000u:
+                    r[1] = 0; r[2] = 0; r[3] = 0;
+                    buffers.cpu.irq_pending[env] = 0;
+                    return;
+                case 0xA000u: r[1] = 1; return;
+                case 0xE000u: r[0] = value; break;
+                default: return;
+            }
+            break;
+        case kBankingNina001:
+            r[0] = value;
+            break;
+        case kBankingM15:
+            r[0] = value;
+            r[1] = static_cast<std::uint8_t>(address & 3u);
+            break;
+        case kBankingIrem32:
+            switch (address & 0xF000u) {
+                case 0x8000u: r[0] = value; break;
+                case 0x9000u: r[1] = value; break;
+                case 0xA000u: r[2] = value; break;
+                case 0xB000u: r[3u + (address & 7u)] = value; break;
+                default: return;
+            }
+            break;
+        case kBankingNamco88:
+            if ((address & 1u) == 0) {
+                r[8] = static_cast<std::uint8_t>(value & 7u);
+                return;
+            }
+            r[r[8] & 7u] = value;
+            break;
+        case kBankingQuattro:
+            if (address < 0xC000u) {
+                r[0] = static_cast<std::uint8_t>((value >> 1) & 0x0Cu);
+            } else {
+                r[1] = static_cast<std::uint8_t>(value & 3u);
+            }
+            break;
+        case kBankingFme7:
+            if (address < 0xA000u) {
+                r[kFmeCommand] = static_cast<std::uint8_t>(value & 0x0Fu);
+                return;
+            }
+            if (address >= 0xC000u) return;  // $C000-$FFFF: the 5B sound chip
+            switch (r[kFmeCommand]) {
+                case 8: r[kFmePrg6] = value; return;
+                case 9: case 10: case 11: r[kFmePrg + r[kFmeCommand] - 9u] = value; break;
+                case 12: r[kFmeMirror] = value; break;
+                case 13:
+                    r[kFmeIrqControl] = value;
+                    buffers.cpu.irq_pending[env] = 0;
+                    return;
+                case 14: r[kFmeIrqCounter] = value; return;
+                case 15: r[kFmeIrqCounter + 1] = value; return;
+                default: r[kFmeChr + r[kFmeCommand]] = value; break;
+            }
+            break;
+        case kBankingCamerica:
+            if ((address & 0xF000u) == 0x9000u) {
+                r[1] = static_cast<std::uint8_t>((value >> 4) & 1u);
+                r[2] = 1;
+            } else {
+                r[0] = value;
+            }
+            break;
         case kBankingCnrom:
             r[0] = buffers.cart.bus_conflicts != 0 ? static_cast<std::uint8_t>(value & rom_byte)
                                                    : value;
@@ -354,6 +750,70 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void write(BatchBuffers& buffers,
     sync(buffers, env);
 }
 
+// CPU cycles elapsed on a board with a cycle-driven IRQ (VRC4, FME-7).
+NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void cpu_cycles(BatchBuffers& buffers, std::uint32_t env,
+                                                              std::uint32_t cycles) {
+    std::uint8_t* r = regs(buffers, env);
+    const std::uint8_t kind = buffers.cart.bank_kind;
+    if (kind_is_vrc(kind)) {
+        if ((r[kVrcIrqControl] & 2u) == 0) return;
+        auto clock = [&]() {
+            if (r[kVrcIrqCounter] == 0xFFu) {
+                r[kVrcIrqCounter] = r[kVrcIrqLatch];
+                buffers.cpu.irq_pending[env] = 1;
+            } else {
+                ++r[kVrcIrqCounter];
+            }
+        };
+        if ((r[kVrcIrqControl] & 4u) != 0) {  // cycle mode
+            for (std::uint32_t i = 0; i < cycles; ++i) clock();
+            return;
+        }
+        auto pre = static_cast<std::int16_t>(r[kVrcPrescaler] | (r[kVrcPrescaler + 1] << 8));
+        for (std::uint32_t i = 0; i < cycles; ++i) {
+            pre = static_cast<std::int16_t>(pre - 3);
+            if (pre <= 0) {
+                pre = static_cast<std::int16_t>(pre + 341);
+                clock();
+            }
+        }
+        r[kVrcPrescaler] = static_cast<std::uint8_t>(pre & 0xFF);
+        r[kVrcPrescaler + 1] = static_cast<std::uint8_t>((pre >> 8) & 0xFF);
+    } else if (kind == kBankingSmb2j40) {
+        if (r[1] == 0) return;
+        std::uint32_t c = r[2] | (r[3] << 8);
+        c += cycles;
+        if (c >= 4096u) {
+            r[1] = 0;
+            c = 0;
+            buffers.cpu.irq_pending[env] = 1;
+        }
+        r[2] = static_cast<std::uint8_t>(c & 0xFF);
+        r[3] = static_cast<std::uint8_t>(c >> 8);
+    } else if (kind == kBankingFme7) {
+        if ((r[kFmeIrqControl] & 0x80u) == 0) return;
+        std::uint32_t c = r[kFmeIrqCounter] | (r[kFmeIrqCounter + 1] << 8);
+        if (c < cycles && (r[kFmeIrqControl] & 1u) != 0) buffers.cpu.irq_pending[env] = 1;
+        c = (c - cycles) & 0xFFFFu;
+        r[kFmeIrqCounter] = static_cast<std::uint8_t>(c & 0xFF);
+        r[kFmeIrqCounter + 1] = static_cast<std::uint8_t>(c >> 8);
+    }
+}
+
+// FME-7's $6000-$7FFF: ROM bank unless bit 6 (RAM) is set. Returns true and the byte when ROM is mapped.
+NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE bool read_6000_rom(const BatchBuffers& buffers, std::uint32_t env,
+                                                                 std::uint16_t address, std::uint8_t& out) {
+    if (buffers.cart.bank_kind == kBankingSmb2j40) {
+        out = buffers.cart.prg_rom[((6u & buffers.cart.prg_page_mask) << 13) + (address & 0x1FFFu)];
+        return true;
+    }
+    if (buffers.cart.bank_kind != kBankingFme7) return false;
+    const std::uint8_t reg = regs(buffers, env)[kFmePrg6];
+    if ((reg & 0x40u) != 0) return false;
+    out = buffers.cart.prg_rom[(((reg & 0x3Fu) & buffers.cart.prg_page_mask) << 13) + (address & 0x1FFFu)];
+    return true;
+}
+
 // MMC3 scanline counter clock (FCEUmm ClockMMC3Counter, revision B).
 NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void mmc3_clock(BatchBuffers& buffers, std::uint32_t env) {
     std::uint8_t* r = regs(buffers, env);
@@ -399,6 +859,7 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void mmc2_ppu_address(const BatchB
 NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE bool prg_ram_enabled(const BatchBuffers& buffers,
                                                                    std::uint32_t env) {
     // MMC1: PRG register bit 4 disables WRAM (FCEUmm MMC1WRAMEnabled).
+    if (buffers.cart.bank_kind == kBankingFme7) return (regs(buffers, env)[kFmePrg6] & 0xC0u) == 0xC0u;
     return buffers.cart.bank_kind != kBankingMmc1 || (regs(buffers, env)[kMmc1Prg] & 0x10u) == 0;
 }
 
@@ -424,10 +885,23 @@ template <BankMode Mode = kBankModeRuntime>
 NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE bool mapper_irq_asserted(const BatchBuffers& buffers,
                                                                        std::uint32_t env) {
     if constexpr (Mode == kBankModePaged || Mode == kBankModeRuntime) {
-        return buffers.cart.bank_kind == kBankingMmc3 && buffers.cpu.irq_pending != nullptr &&
+        return cart_is_paged<Mode>(buffers.cart) && buffers.cpu.irq_pending != nullptr &&
                buffers.cpu.irq_pending[env] != 0;
     } else {
         return false;
+    }
+}
+
+// CPU cycles for boards that count them (compiled out for NROM and window boards).
+template <BankMode Mode = kBankModeRuntime>
+NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void mapper_cpu_cycles(BatchBuffers& buffers, std::uint32_t env,
+                                                                     std::uint32_t cycles) {
+    if constexpr (Mode == kBankModePaged || Mode == kBankModeRuntime) {
+        const std::uint8_t kind = buffers.cart.bank_kind;
+        if ((paged::kind_is_vrc(kind) || kind == kBankingFme7 || kind == kBankingSmb2j40) &&
+            buffers.mapper.regs != nullptr) {
+            paged::cpu_cycles(buffers, env, cycles);
+        }
     }
 }
 
@@ -503,9 +977,8 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void write_mapper_register(BatchBu
                 return;
             }
         }
-        if (address < 0x8000) {
-            // The mapper register is in the CPU space; a write to $6000-$7FFF
-            // reaches only WRAM.
+        if (address < 0x8000 && !cart_is_paged<Mode>(cart)) {
+            // Window boards: a write to $6000-$7FFF reaches only WRAM.
             return;
         }
         if (cart_is_paged<Mode>(cart)) {

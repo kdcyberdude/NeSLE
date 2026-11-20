@@ -254,6 +254,12 @@ NESLE_CUDA_HD inline std::uint8_t batch_cpu_read(BatchBuffers& buffers,
         return 0x40;
     }
     if (address >= 0x6000 && address < 0x8000) {
+        if constexpr (Mode == kBankModePaged || Mode == kBankModeRuntime) {
+            std::uint8_t rom_byte;
+            if (buffers.mapper.regs != nullptr && paged::read_6000_rom(buffers, env, address, rom_byte)) {
+                return rom_byte;
+            }
+        }
         if (!mapper_prg_ram_enabled<Mode>(buffers, env)) {
             // Disabled board RAM: open bus, which after an absolute or indirect
             // fetch still holds the address high byte.
@@ -374,10 +380,23 @@ NESLE_CUDA_HD inline void batch_cpu_write(BatchBuffers& buffers,
         if (mapper_prg_ram_enabled<Mode>(buffers, env)) {
             env_prg_ram(buffers, env)[address - 0x6000] = value;
         }
+        if constexpr (Mode == kBankModePaged || Mode == kBankModeRuntime) {
+            if (buffers.cart.bank_kind > kBankingMmc3 || buffers.cart.mapper == 189) {  // boards with a register in $6000-$7FFF
+                bus_write_mapper<Mode>(buffers, env, address, value, hot);
+            }
+        }
         return;
     }
     if (address >= 0x8000) {
         bus_write_mapper<Mode>(buffers, env, address, value, hot);
+        return;
+    }
+    if (address >= 0x4020) {
+        if constexpr (Mode == kBankModePaged || Mode == kBankModeRuntime) {
+            if (buffers.cart.bank_kind > kBankingMmc3 || buffers.cart.mapper == 189) {  // expansion-area registers ($4100 NINA-03/06, $4120 189, ...)
+                bus_write_mapper<Mode>(buffers, env, address, value, hot);
+            }
+        }
     }
 }
 

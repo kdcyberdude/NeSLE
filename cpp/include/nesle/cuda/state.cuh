@@ -102,7 +102,7 @@ constexpr std::uint8_t kPageMapSingleHigh = 0x0F;  // 1 1 1 1
 // Paged boards (see MapperStateSoA): per-env page tables and board registers.
 constexpr int kPrgPages = 4;          // 8 KB CPU pages at $8000, $A000, $C000, $E000
 constexpr int kChrPages = 8;          // 1 KB PPU pages at $0000-$1FFF
-constexpr int kMapperRegBytes = 16;   // board registers, layout per board in mapper.cuh
+constexpr int kMapperRegBytes = 48;   // board registers, layout per board in mapper.cuh
 
 // How the $8000-$FFFF window is split. Resolved once on the host from the iNES
 // header (mapper number + submapper + CHR presence) so the device code never
@@ -122,6 +122,32 @@ enum BankKind : std::uint8_t {
     kBankingMmc1,   // mapper 1: serial shift register, PRG/CHR modes, mirroring
     kBankingMmc2,   // mapper 9: 8 KB PRG bank, 4 KB CHR banks picked by $FD/$FE latches
     kBankingMmc3,   // mapper 4: 8 KB PRG / 1-2 KB CHR banks, scanline IRQ counter
+    // Discrete-logic latch boards (FCEUmm boards/datalatch.c and friends): one data latch picks 32/16 KB PRG and
+    // 8 KB CHR. Registers at $8000-$FFFF unless noted.
+    kBankingAxrom,        // 7: 32 KB PRG, one-screen mirroring, CHR RAM
+    kBankingColorDreams,  // 11: 32 KB PRG (low bits), 8 KB CHR (high nibble)
+    kBankingGxrom,        // 66: 32 KB PRG (bits 4-5), 8 KB CHR (bits 0-1)
+    kBankingCamerica,     // 71: 16 KB PRG at $8000, last 16 KB fixed; $9000 one-screen mirroring
+    kBankingNina0306,     // 79: register at $4100 (A & $100): PRG 32 KB bit 3, CHR 8 KB bits 0-2
+    kBankingHes,          // 113: register at $4100: PRG bits 3-5, CHR bits 0-2 + 6, mirroring bit 7
+    kBankingJaleco140,    // 140: register at $6000-$7FFF: PRG bits 4-5, CHR bits 0-3
+    kBankingBitCorp38,    // 38: register at $7000-$7FFF: PRG bits 0-1, CHR bits 2-3
+    kBankingJaleco87,     // 87: register at $6000-$7FFF: CHR 8 KB = bit 1 | bit 0 << 1
+    // Konami VRC2/VRC4 (FCEUmm vrc2and4.c): 2 switchable 8 KB PRG, 8 x 1 KB CHR, VRC4 IRQ (scanline/cycle mode).
+    // The four iNES numbers differ only in which CPU address lines select the register within a $1000 page.
+    kBankingVrc21,        // 21: VRC4a (A1, A2) / VRC4c (A6, A7)
+    kBankingVrc22,        // 22: VRC2a (A1, A0), CHR bank >> 1
+    kBankingVrc23,        // 23: VRC2b (A0, A1) / VRC4e (A2, A3)
+    kBankingVrc25,        // 25: VRC4b (A1, A0) / VRC4d (A3, A2)
+    kBankingVrc6a,        // 24: Konami VRC6 (A0, A1): 16 KB + 8 KB PRG, 8 x 1 KB CHR, VRC IRQ
+    kBankingVrc6b,        // 26: VRC6 with A0/A1 swapped
+    kBankingSmb2j40,      // 40: SMB2J pirate: ROM bank 6 at $6000, 8 KB at $C000 switchable, 4096-cycle IRQ
+    kBankingQuattro,      // 232: Camerica BF9096: 64 KB outer block at $8000-$BFFF writes, 16 KB inner at $C000-$FFFF
+    kBankingFme7,         // 69: Sunsoft FME-7: command/parameter, ROM or RAM at $6000, 16-bit CPU-cycle IRQ
+    kBankingNina001,      // 34 with CHR ROM: NINA-001: $7FFD PRG 32 KB, $7FFE/$7FFF CHR 4 KB (and BNROM's $8000 latch)
+    kBankingM15,          // 15: 100-in-1 Contra Function 16: address bits 0-1 pick the PRG mode, data the bank
+    kBankingIrem32,       // 32: Irem G-101: two 8 KB PRG (swappable), 8 x 1 KB CHR
+    kBankingNamco88,      // 88: Namco 108 with CHR A16 forced high for $1000-$1FFF
     kBankingFirstPaged = kBankingCnrom,
 };
 

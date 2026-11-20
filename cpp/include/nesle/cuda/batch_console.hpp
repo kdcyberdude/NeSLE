@@ -70,6 +70,7 @@ step_batch_console_instruction_hot(BatchBuffers& buffers,
 
     const auto cpu_cycles = static_cast<std::uint32_t>(state.cycles - cycles_before);
     const auto ppu_cycles = cpu_cycles * kPpuCyclesPerCpuCycle;
+    mapper_cpu_cycles<Mode>(buffers, env, cpu_cycles);
     const auto ppu_step = batch_ppu_step_env_hot<Mode>(buffers, env, ppu_cycles, hot);
 
     return BatchConsoleStepResult{
@@ -129,6 +130,7 @@ step_batch_console_instruction_lazy(BatchBuffers& buffers,
 
     const auto cpu_cycles = static_cast<std::uint32_t>(state.cycles - cycles_before);
     const auto ppu_cycles = cpu_cycles * kPpuCyclesPerCpuCycle;
+    mapper_cpu_cycles<Mode>(buffers, env, cpu_cycles);
 
     return BatchConsoleStepResult{
         cpu_step,

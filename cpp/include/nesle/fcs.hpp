@@ -10,6 +10,7 @@
 #include <string_view>
 
 #include "nesle/rom.hpp"
+#include "nesle/cuda/state.cuh"
 
 namespace nesle::fcs {
 
@@ -370,7 +371,7 @@ inline void require_subchunks(std::span<const std::uint8_t> payload, std::string
 // MapperLayout::bank_kind. Returns false when the state lacks the board's registers
 // (it was saved for another board, or by an emulator that does not write them).
 [[nodiscard]] inline bool board_registers(const StateSnapshot& s, std::uint8_t bank_kind,
-                                          std::array<std::uint8_t, 16>& regs,
+                                          std::array<std::uint8_t, cuda::kMapperRegBytes>& regs,
                                           std::uint8_t& irq_line) {
     regs.fill(0);
     irq_line = 0;
