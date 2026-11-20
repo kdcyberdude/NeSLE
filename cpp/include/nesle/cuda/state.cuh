@@ -168,6 +168,9 @@ enum BankKind : std::uint8_t {
     kBankingTaito48,       // 48: Taito TC0690: 8 KB PRG x2, 2 KB + 1 KB CHR, $E000 mirroring, scanline IRQ counting up to $100
     kBankingJaleco18,      // 18: Jaleco SS88006: nibble-wide 8 KB PRG / 1 KB CHR registers, 16-bit CPU-cycle IRQ
     kBankingM117,          // 117: Future Media: 8 KB PRG x4, 1 KB CHR x8, scanline IRQ
+    kBankingM222,          // 222: Dragon Ninja pirate: 8 KB PRG x2, 1 KB CHR x8, scanline IRQ up-counter loaded at $F000
+    kBankingBandai16,      // 16: Bandai FCG + 24C02 EEPROM (data in prg_ram): 16 KB PRG, 1 KB CHR, CPU-cycle IRQ
+    kBankingFfe,           // 17 (and 6): FFE as old FCEUmm runs both: $8000 latch 16 KB PRG / 8 KB CHR, $42FE mirroring, $4500 cycle IRQ
     kBankingFirstPaged = kBankingCnrom,
 };
 

@@ -79,6 +79,9 @@ constexpr std::uint8_t kBankKindCprom = 42;
 constexpr std::uint8_t kBankKindTaito48 = 43;
 constexpr std::uint8_t kBankKindJaleco18 = 44;
 constexpr std::uint8_t kBankKindM117 = 45;
+constexpr std::uint8_t kBankKindM222 = 46;
+constexpr std::uint8_t kBankKindBandai16 = 47;
+constexpr std::uint8_t kBankKindFfe = 48;
 
 // iNES mapper numbers with a banking path. Mirrored in nesle::cuda.
 constexpr std::uint16_t kMapperNrom = 0;

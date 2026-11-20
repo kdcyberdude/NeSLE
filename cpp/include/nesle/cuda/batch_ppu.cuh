@@ -201,7 +201,7 @@ NESLE_CUDA_HD inline bool batch_ppu_has_scanline_counter(const BatchBuffers& buf
     if constexpr (Mode == kBankModePaged || Mode == kBankModeRuntime) {
         return (buffers.cart.bank_kind == kBankingMmc3 || buffers.cart.bank_kind == kBankingM91 ||
                 buffers.cart.bank_kind == kBankingJy90 || buffers.cart.bank_kind == kBankingTaito48 ||
-                buffers.cart.bank_kind == kBankingM117) &&
+                buffers.cart.bank_kind == kBankingM117 || buffers.cart.bank_kind == kBankingM222) &&
                buffers.mapper.regs != nullptr;
     } else {
         return false;

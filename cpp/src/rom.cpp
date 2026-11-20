@@ -159,6 +159,7 @@ MapperLayout describe_mapper(const RomMetadata& metadata) noexcept {
             break;
 
         case 1:   // MMC1 (SxROM)
+        case 105: // NWC 1990: MMC1 with a timer IRQ
         case 3:   // CNROM
         case 4:   // MMC3 (TxROM)
         case 118: // MMC3, nametables from CHR bit 7 (TxSROM)
@@ -173,7 +174,7 @@ MapperLayout describe_mapper(const RomMetadata& metadata) noexcept {
         case 9:   // MMC2 (PxROM)
         case 10: { // MMC4 (FxROM): MMC2's latches, 16 KB PRG
             // Paged boards: no window; the bus goes through per-env page tables.
-            layout.bank_kind = metadata.mapper == 1   ? kBankKindMmc1
+            layout.bank_kind = metadata.mapper == 1 || metadata.mapper == 105 ? kBankKindMmc1
                                : metadata.mapper == 3 ? kBankKindCnrom
                                : metadata.mapper == 9 || metadata.mapper == 10 ? kBankKindMmc2
                                                       : kBankKindMmc3;
@@ -187,14 +188,14 @@ MapperLayout describe_mapper(const RomMetadata& metadata) noexcept {
                                 page_count_is_power_of_two(chr_bytes, 0x2000);
             // CNROM and MMC2 have no CHR RAM variant that FCEUmm drives this way.
             const bool chr_kind_ok =
-                metadata.chr_rom_size != 0 || metadata.mapper == 1 || layout.bank_kind == kBankKindMmc3;
+                metadata.chr_rom_size != 0 || layout.bank_kind == kBankKindMmc1 || layout.bank_kind == kBankKindMmc3;
             layout.prg_page_mask = static_cast<std::uint16_t>(metadata.prg_rom_size / 0x2000 - 1);
             layout.chr_page_mask = static_cast<std::uint16_t>(chr_bytes / 0x400 - 1);
             layout.supported = prg_ok && chr_ok && chr_kind_ok;
             break;
         }
 
-        case 15: case 32: case 88: case 91: case 42: case 117: case 18: case 48: case 13: case 8: case 227: case 73: case 188: case 243: case 133: case 246: case 75: case 90: case 83: case 228:
+        case 15: case 32: case 88: case 91: case 42: case 17: case 6: case 16: case 222: case 117: case 18: case 48: case 13: case 8: case 227: case 73: case 188: case 243: case 133: case 246: case 75: case 90: case 83: case 228:
         case 24: case 26: case 40: case 232:
         case 21: case 22: case 23: case 25: case 69:
         case 7: case 11: case 66: case 71: case 79: case 113: case 140: case 38: case 87: {
@@ -221,6 +222,9 @@ MapperLayout describe_mapper(const RomMetadata& metadata) noexcept {
                 case 88: layout.bank_kind = kBankKindNamco88; break;
                 case 91: layout.bank_kind = kBankKindM91; break;
                 case 42: layout.bank_kind = kBankKindM42; break;
+                case 17: case 6: layout.bank_kind = kBankKindFfe; break;
+                case 16: layout.bank_kind = kBankKindBandai16; break;
+                case 222: layout.bank_kind = kBankKindM222; break;
                 case 117: layout.bank_kind = kBankKindM117; break;
                 case 18: layout.bank_kind = kBankKindJaleco18; break;
                 case 48: layout.bank_kind = kBankKindTaito48; break;
@@ -245,7 +249,9 @@ MapperLayout describe_mapper(const RomMetadata& metadata) noexcept {
             layout.chr_page_mask = static_cast<std::uint16_t>(chr_bytes / 0x400 - 1);
             layout.supported = metadata.prg_rom_size >= 0x4000 && metadata.prg_rom_size <= 512u * 1024u &&
                                page_count_is_power_of_two(metadata.prg_rom_size, 0x2000) &&
-                               chr_bytes <= 1024u * 1024u && page_count_is_power_of_two(chr_bytes, 0x2000);
+                               chr_bytes <= 1024u * 1024u && page_count_is_power_of_two(chr_bytes, 0x2000) &&
+                               // FCEUmm writes a trainer to $7000 at power; the hosts have no path for it yet.
+                               !metadata.has_trainer;
             break;
         }
 

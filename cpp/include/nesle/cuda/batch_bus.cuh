@@ -110,6 +110,10 @@ NESLE_CUDA_HD inline void bus_write_mapper(BatchBuffers& buffers,
                                            std::uint8_t value,
                                            PpuHotState* hot) {
     if constexpr (Mode == kBankModePaged || Mode == kBankModeRuntime) {
+        if (buffers.cart.bank_kind == kBankingM222) {  // M222Write reads FCEUmm's scanline (< 240: visible)
+            const std::uint32_t dot = hot != nullptr ? hot->frame_dot : buffers.ppu.frame_dot[env];
+            paged::regs(buffers, env)[13] = dot < 240u * 341u ? 1 : 0;  // 341 dots per line
+        }
         if (cart_is_paged<Mode>(buffers.cart) && frame_log_active(buffers, hot)) {
             const std::uint32_t* pages = buffers.mapper.chr_page + static_cast<std::uint64_t>(env) * kChrPages;
             const std::uint8_t* r = paged::regs(buffers, env);
