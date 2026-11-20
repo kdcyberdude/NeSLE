@@ -426,6 +426,12 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void sync(const BatchBuffers& buff
                     }
                 }
             }
+            if (buffers.cart.mapper == 74) {  // M74CW: banks 8 and 9 are the 2 KB CHR RAM (in ext_ram, kChrPageRam)
+                const std::uint32_t banks[8] = {r[0] & 0xFEu, r[0] | 1u, r[1] & 0xFEu, r[1] | 1u, r[2], r[3], r[4], r[5]};
+                for (std::uint32_t i = 0; i < 8u; ++i) {
+                    if (banks[i] == 8u || banks[i] == 9u) set_chr1_ram(buffers, env, i ^ flip, banks[i] & 1u);
+                }
+            }
             if (buffers.cart.mapper == 118) {
                 // TxSROM: CHR A17 (bit 7) of the bank in each 1 KB of $0000-$0FFF drives CIRAM A10 for the
                 // nametable at the same index; the bit is not a CHR address line.
@@ -2513,6 +2519,9 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE std::uint8_t read_chr(const BatchB
                 buffers.mapper.chr_page[static_cast<std::uint64_t>(env) * kChrPages +
                                         ((address >> 10) & 7u)] +
                 (address & 0x3FFu);
+            if ((offset & kChrPageRam) != 0 && cart.mapper == 74) {  // 74's 2 KB CHR RAM is its ext_ram
+                return buffers.mapper.ext_ram[static_cast<std::uint64_t>(env) * cart.ext_ram_bytes + (offset & 0x7FFu)];
+            }
             if ((offset & kChrPageRam) != 0) {  // TQROM / CPROM CHR RAM kept in prg_ram
                 return buffers.cpu.prg_ram[static_cast<std::uint64_t>(env) * kPrgRamBytes + (offset & 0x1FFFu)];
             }
@@ -2548,7 +2557,10 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void write_chr(BatchBuffers& buffe
             if (cart_is_paged<Mode>(buffers.cart)) {  // TQROM: the CHR RAM pages take the write
                 const std::uint32_t page =
                     buffers.mapper.chr_page[static_cast<std::uint64_t>(env) * kChrPages + ((address >> 10) & 7u)];
-                if ((page & kChrPageRam) != 0) {
+                if ((page & kChrPageRam) != 0 && buffers.cart.mapper == 74) {
+                    buffers.mapper.ext_ram[static_cast<std::uint64_t>(env) * buffers.cart.ext_ram_bytes +
+                                           ((page + (address & 0x3FFu)) & 0x7FFu)] = value;
+                } else if ((page & kChrPageRam) != 0) {
                     buffers.cpu.prg_ram[static_cast<std::uint64_t>(env) * kPrgRamBytes +
                                         ((page + (address & 0x3FFu)) & 0x1FFFu)] = value;
                 }

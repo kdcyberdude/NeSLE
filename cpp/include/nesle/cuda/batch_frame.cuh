@@ -503,6 +503,10 @@ NESLE_CUDA_FRAME_HD NESLE_CUDA_FRAME_INLINE std::uint8_t replay_chr(const Replay
     if (b.cart.bank_kind >= kBankingFirstPaged) {
         const std::uint32_t page = s.chr[address >> 10];
         const std::uint32_t offset = ((page & b.cart.chr_page_mask) << 10) | (address & 0x3FFu);
+        if ((page & 0x8000u) != 0 && b.cart.mapper == 74) {  // 74's 2 KB CHR RAM, in ext_ram
+            return b.mapper.ext_ram[static_cast<std::uint64_t>(src.env) * b.cart.ext_ram_bytes +
+                                    (((page & 1u) << 10) | (address & 0x3FFu))];
+        }
         if ((page & 0x8000u) != 0) {  // TQROM CHR RAM (kChrPageRam), kept in prg_ram
             return b.cpu.prg_ram[static_cast<std::uint64_t>(src.env) * kPrgRamBytes + (((page & 7u) << 10) | (address & 0x3FFu))];
         }

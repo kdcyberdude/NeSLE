@@ -192,6 +192,7 @@ MapperLayout describe_mapper(const RomMetadata& metadata) noexcept {
         case 64:  // Tengen RAMBO-1
         case 187: // MMC3 with a $5000/$6000 PRG override and CHR A18 on the 2 KB half
         case 119: // TQROM: MMC3 with CHR ROM and 8 KB CHR RAM side by side
+        case 74:  // MMC3 with 2 KB CHR RAM at banks 8-9 (ext_ram)
         case 47:  // NES-QJ: MMC3 with a 128 KB block register at $6000
         case 114: // MMC3 with scrambled registers and a 16 KB PRG override at $5000-$7FFF
         case 182: // FCEUmm's database runs both 182 ROMs here as 114 (182 itself is deprecated there)
@@ -216,6 +217,7 @@ MapperLayout describe_mapper(const RomMetadata& metadata) noexcept {
             layout.prg_page_mask = static_cast<std::uint16_t>(metadata.prg_rom_size / 0x2000 - 1);
             layout.chr_page_mask = static_cast<std::uint16_t>(chr_bytes / 0x400 - 1);
             layout.supported = prg_ok && chr_ok && chr_kind_ok;
+            if (metadata.mapper == 74) layout.ext_ram_bytes = 2048;
             break;
         }
 
