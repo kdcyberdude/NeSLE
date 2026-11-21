@@ -1890,8 +1890,7 @@ NESLE_CUDA_MAPPER_HD NESLE_CUDA_MAPPER_INLINE void write(BatchBuffers& buffers,
             break;
         case kBankingMmc1:
             // FCEUmm also drops a write within two cycles of a reset write (the
-            // second write of a read-modify-write). This CPU core issues one write
-            // per instruction, so that case cannot arise here.
+            // second write of a read-modify-write): BatchCpuBusT::rmw_dummy_write.
             if ((value & 0x80u) != 0) {
                 r[kMmc1Control] = static_cast<std::uint8_t>(r[kMmc1Control] | 0x0Cu);
                 r[kMmc1Shift] = 0;

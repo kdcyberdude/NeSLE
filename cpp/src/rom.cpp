@@ -282,9 +282,9 @@ MapperLayout describe_mapper(const RomMetadata& metadata) noexcept {
             layout.chr_page_mask = static_cast<std::uint16_t>(chr_bytes / 0x400 - 1);
             layout.supported = metadata.prg_rom_size >= 0x4000 && metadata.prg_rom_size <= 512u * 1024u &&
                                page_count_is_power_of_two(metadata.prg_rom_size, 0x2000) &&
-                               chr_bytes <= 1024u * 1024u && page_count_is_power_of_two(chr_bytes, 0x2000) &&
-                               // A trainer is copied to $7000 (prg_ram + $1000) by the host at power; FFE only.
-                               (!metadata.has_trainer || layout.bank_kind == kBankKindFfe);
+                               // A trainer (RomImage::trainer) is the host's to copy to $7000 at power, as
+                               // FCEUmm's iNES_ExecPower does on every board.
+                               chr_bytes <= 1024u * 1024u && page_count_is_power_of_two(chr_bytes, 0x2000);
             break;
         }
 
