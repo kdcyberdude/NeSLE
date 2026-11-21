@@ -96,6 +96,24 @@ NESLE_CPU_HD void write8(Bus& bus, std::uint16_t address, std::uint8_t value) {
     bus.write(address, value);
 }
 
+// A read-modify-write instruction writes the unchanged value back before the new one (FCEUmm's X6502 does both
+// writes; MMC1 boards see the first). A bus with rmw_dummy_write() gets that first write; other buses do not.
+template <typename Bus>
+NESLE_CPU_HD auto rmw_dummy(Bus& bus, std::uint16_t address, std::uint8_t value, int)
+    -> decltype(bus.rmw_dummy_write(address, value), void()) {
+    bus.rmw_dummy_write(address, value);
+}
+
+template <typename Bus>
+NESLE_CPU_HD void rmw_dummy(Bus&, std::uint16_t, std::uint8_t, long) {}
+
+template <typename Bus>
+[[nodiscard]] NESLE_CPU_HD std::uint8_t rmw_read8(Bus& bus, std::uint16_t address) {
+    const auto value = read8(bus, address);
+    rmw_dummy(bus, address, value, 0);
+    return value;
+}
+
 template <typename Bus>
 [[nodiscard]] NESLE_CPU_HD std::uint16_t read16(Bus& bus, std::uint16_t address) {
     const auto low = static_cast<std::uint16_t>(read8(bus, address));
@@ -704,13 +722,13 @@ template <typename Bus>
             break;
         }
         case Op::INC: {
-            const auto v = static_cast<std::uint8_t>(read8(bus, addr) + 1);
+            const auto v = static_cast<std::uint8_t>(rmw_read8(bus, addr) + 1);
             write8(bus, addr, v);
             set_zn(state, v);
             break;
         }
         case Op::DEC: {
-            const auto v = static_cast<std::uint8_t>(read8(bus, addr) - 1);
+            const auto v = static_cast<std::uint8_t>(rmw_read8(bus, addr) - 1);
             write8(bus, addr, v);
             set_zn(state, v);
             break;
@@ -723,28 +741,28 @@ template <typename Bus>
             if (entry.mode == AddrMode::Accumulator) {
                 state.a = asl_value(state.a);
             } else {
-                write8(bus, addr, asl_value(read8(bus, addr)));
+                write8(bus, addr, asl_value(rmw_read8(bus, addr)));
             }
             break;
         case Op::LSR:
             if (entry.mode == AddrMode::Accumulator) {
                 state.a = lsr_value(state.a);
             } else {
-                write8(bus, addr, lsr_value(read8(bus, addr)));
+                write8(bus, addr, lsr_value(rmw_read8(bus, addr)));
             }
             break;
         case Op::ROL:
             if (entry.mode == AddrMode::Accumulator) {
                 state.a = rol_value(state.a);
             } else {
-                write8(bus, addr, rol_value(read8(bus, addr)));
+                write8(bus, addr, rol_value(rmw_read8(bus, addr)));
             }
             break;
         case Op::ROR:
             if (entry.mode == AddrMode::Accumulator) {
                 state.a = ror_value(state.a);
             } else {
-                write8(bus, addr, ror_value(read8(bus, addr)));
+                write8(bus, addr, ror_value(rmw_read8(bus, addr)));
             }
             break;
         case Op::JMP: state.pc = addr; break;
@@ -801,21 +819,21 @@ template <typename Bus>
         case Op::LAX: load(state.a, read8(bus, addr)); state.x = state.a; break;
         case Op::SAX: write8(bus, addr, static_cast<std::uint8_t>(state.a & state.x)); break;
         case Op::DCP: {
-            const auto v = static_cast<std::uint8_t>(read8(bus, addr) - 1);
+            const auto v = static_cast<std::uint8_t>(rmw_read8(bus, addr) - 1);
             write8(bus, addr, v);
             compare(state.a, v);
             break;
         }
         case Op::ISC: {
-            const auto v = static_cast<std::uint8_t>(read8(bus, addr) + 1);
+            const auto v = static_cast<std::uint8_t>(rmw_read8(bus, addr) + 1);
             write8(bus, addr, v);
             sbc(v);
             break;
         }
-        case Op::SLO: { const auto v = asl_value(read8(bus, addr)); write8(bus, addr, v); logical(v, 'o'); break; }
-        case Op::RLA: { const auto v = rol_value(read8(bus, addr)); write8(bus, addr, v); logical(v, 'a'); break; }
-        case Op::SRE: { const auto v = lsr_value(read8(bus, addr)); write8(bus, addr, v); logical(v, 'e'); break; }
-        case Op::RRA: { const auto v = ror_value(read8(bus, addr)); write8(bus, addr, v); adc(v); break; }
+        case Op::SLO: { const auto v = asl_value(rmw_read8(bus, addr)); write8(bus, addr, v); logical(v, 'o'); break; }
+        case Op::RLA: { const auto v = rol_value(rmw_read8(bus, addr)); write8(bus, addr, v); logical(v, 'a'); break; }
+        case Op::SRE: { const auto v = lsr_value(rmw_read8(bus, addr)); write8(bus, addr, v); logical(v, 'e'); break; }
+        case Op::RRA: { const auto v = ror_value(rmw_read8(bus, addr)); write8(bus, addr, v); adc(v); break; }
         case Op::ANC:
             logical(read8(bus, addr), 'a');
             set_flag(state, Carry, (state.a & 0x80) != 0);

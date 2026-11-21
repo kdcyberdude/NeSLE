@@ -39,13 +39,27 @@ public:
     }
 
     NESLE_CUDA_BATCH_CPU_HD void write(std::uint16_t address, std::uint8_t value) {
+        if (drop_next_write_) {
+            drop_next_write_ = false;
+            return;
+        }
         batch_cpu_write<Mode>(buffers_, env_, address, value, hot_);
+    }
+
+    // The first write of a read-modify-write (cpu::rmw_read8), seen by the boards in $8000-$FFFF as in FCEUmm. MMC1
+    // (mmc1.c MMC1_write) ignores a write within two cycles of a reset write, so after a reset written this way the
+    // instruction's second write is dropped (Bill & Ted resets with INC $FFFF on a $FF byte).
+    NESLE_CUDA_BATCH_CPU_HD void rmw_dummy_write(std::uint16_t address, std::uint8_t value) {
+        if (address < 0x8000u) return;
+        batch_cpu_write<Mode>(buffers_, env_, address, value, hot_);
+        drop_next_write_ = buffers_.cart.bank_kind == kBankingMmc1 && (value & 0x80u) != 0;
     }
 
 private:
     BatchBuffers& buffers_;
     std::uint32_t env_ = 0;
     PpuHotState* hot_ = nullptr;
+    bool drop_next_write_ = false;
 };
 
 using BatchCpuBus = BatchCpuBusT<kBankModeRuntime>;
