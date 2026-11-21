@@ -16,17 +16,9 @@
 // so lets it keep loaded values in registers across stores through sibling
 // pointers.
 //
-// The render path (batch_render.cuh, resolve_render_env_views) copies
-// BatchBuffers into shadow views whose members are repointed at the snap_*
-// arrays, so ACROSS instances the same allocation is reachable through
-// several names (e.g. play.ppu.nametable_ram == buffers.ppu.snap_nametable,
-// and hud/play share every repointed array). That is still conforming:
-// restrict (C99 6.7.3.1 semantics, which the __restrict extensions follow)
-// only constrains objects that are MODIFIED during the pointers' lifetime,
-// and rendering writes nothing but frames_rgb - a distinct allocation only
-// ever accessed through the single `target` view. Everywhere state is
-// mutated (stepping, resets, snapshot capture/restore) only one BatchBuffers
-// instance is live and its members point at pairwise-distinct allocations.
+// Everywhere state is mutated (stepping, resets, snapshot capture/restore,
+// rendering into frames_rgb) only one BatchBuffers instance is live and its
+// members point at pairwise-distinct allocations.
 #if defined(__CUDACC__)
 #define NESLE_RESTRICT __restrict__
 #elif defined(_MSC_VER)
@@ -100,6 +92,30 @@ constexpr int kRgbChannels = 3;
 constexpr std::uint8_t kNametableVertical = 0;
 constexpr std::uint8_t kNametableHorizontal = 1;
 constexpr std::uint8_t kNametableFourScreen = 2;
+// Paged boards keep their run-time mirroring as a page map: bit n is the 1 KB
+// CIRAM page (0 = $000, 1 = $400) behind logical nametable n ($2000 + n * $400).
+constexpr std::uint8_t kPageMapVertical = 0x0A;    // 0 1 0 1
+constexpr std::uint8_t kPageMapHorizontal = 0x0C;  // 0 0 1 1
+constexpr std::uint8_t kPageMapSingleLow = 0x00;   // 0 0 0 0
+constexpr std::uint8_t kPageMapSingleHigh = 0x0F;  // 1 1 1 1
+
+// Paged boards (see MapperStateSoA): per-env page tables and board registers.
+constexpr int kPrgPages = 4;          // 8 KB CPU pages at $8000, $A000, $C000, $E000
+constexpr int kChrPages = 8;          // 1 KB PPU pages at $0000-$1FFF
+// A chr_page entry with this bit maps the 1 KB page to CHR RAM on a CHR ROM board (TQROM, 119). The board has no
+// PRG RAM, so its 8 KB of CHR RAM lives in the env's prg_ram buffer; the offset's low 13 bits index it.
+constexpr std::uint32_t kChrPageRam = 0x80000000u;
+// Nametable page map bits 4-7: that quadrant reads a 1 KB CHR ROM page (board register kNtChrPage + quadrant)
+// instead of CIRAM, and ignores writes (Namco 163, Sunsoft-4).
+constexpr std::uint8_t kPageMapNtChr = 0xF0u;
+constexpr std::uint32_t kNtChrPage = 44;  // 4 board registers, one per quadrant
+// prg_page flags (MMC5): the page is WRAM (offset into ext_ram), or nothing (open bus).
+constexpr std::uint32_t kPrgPageRam = 0x80000000u;
+constexpr std::uint32_t kPrgPageOpen = 0x40000000u;
+// Four-screen carts (any board but MMC5 / 74): ext_ram holds nametables 2-3 live, then their vblank snapshot.
+constexpr std::uint32_t kFourScreenLive = 0x000u, kFourScreenSnap = 0x800u;
+constexpr std::uint32_t kMmc5ExRam = 0x000u, kMmc5ExSnap = 0x400u, kMmc5ExHeader = 0x800u, kMmc5ExWram = 0x1000u;
+constexpr int kMapperRegBytes = 48;   // board registers, layout per board in mapper.cuh
 
 // How the $8000-$FFFF window is split. Resolved once on the host from the iNES
 // header (mapper number + submapper + CHR presence) so the device code never
@@ -112,6 +128,63 @@ enum BankKind : std::uint8_t {
     kBankingUxrom16k,
     // BNROM: single 32 KB window at $8000-$FFFF.
     kBankingBnrom32k,
+    // Paged boards, from here on: the bus reads PRG through a per-env 8 KB page
+    // table and CHR through a per-env 1 KB page table, mirroring is a per-env
+    // register, and the board may raise IRQs. Everything >= kBankingFirstPaged.
+    kBankingCnrom,  // mapper 3: 32 KB PRG fixed, 8 KB CHR bank latch
+    kBankingMmc1,   // mapper 1: serial shift register, PRG/CHR modes, mirroring
+    kBankingMmc2,   // mapper 9: 8 KB PRG bank, 4 KB CHR banks picked by $FD/$FE latches
+    kBankingMmc3,   // mapper 4: 8 KB PRG / 1-2 KB CHR banks, scanline IRQ counter
+    // Discrete-logic latch boards (FCEUmm boards/datalatch.c and friends): one data latch picks 32/16 KB PRG and
+    // 8 KB CHR. Registers at $8000-$FFFF unless noted.
+    kBankingAxrom,        // 7: 32 KB PRG, one-screen mirroring, CHR RAM
+    kBankingColorDreams,  // 11: 32 KB PRG (low bits), 8 KB CHR (high nibble)
+    kBankingGxrom,        // 66: 32 KB PRG (bits 4-5), 8 KB CHR (bits 0-1)
+    kBankingCamerica,     // 71: 16 KB PRG at $8000, last 16 KB fixed; $9000 one-screen mirroring
+    kBankingNina0306,     // 79: register at $4100 (A & $100): PRG 32 KB bit 3, CHR 8 KB bits 0-2
+    kBankingHes,          // 113: register at $4100: PRG bits 3-5, CHR bits 0-2 + 6, mirroring bit 7
+    kBankingJaleco140,    // 140: register at $6000-$7FFF: PRG bits 4-5, CHR bits 0-3
+    kBankingBitCorp38,    // 38: register at $7000-$7FFF: PRG bits 0-1, CHR bits 2-3
+    kBankingJaleco87,     // 87: register at $6000-$7FFF: CHR 8 KB = bit 1 | bit 0 << 1
+    // Konami VRC2/VRC4 (FCEUmm vrc2and4.c): 2 switchable 8 KB PRG, 8 x 1 KB CHR, VRC4 IRQ (scanline/cycle mode).
+    // The four iNES numbers differ only in which CPU address lines select the register within a $1000 page.
+    kBankingVrc21,        // 21: VRC4a (A1, A2) / VRC4c (A6, A7)
+    kBankingVrc22,        // 22: VRC2a (A1, A0), CHR bank >> 1
+    kBankingVrc23,        // 23: VRC2b (A0, A1) / VRC4e (A2, A3)
+    kBankingVrc25,        // 25: VRC4b (A1, A0) / VRC4d (A3, A2)
+    kBankingVrc6a,        // 24: Konami VRC6 (A0, A1): 16 KB + 8 KB PRG, 8 x 1 KB CHR, VRC IRQ
+    kBankingVrc6b,        // 26: VRC6 with A0/A1 swapped
+    kBankingSmb2j40,      // 40: SMB2J pirate: ROM bank 6 at $6000, 8 KB at $C000 switchable, 4096-cycle IRQ
+    kBankingQuattro,      // 232: Camerica BF9096: 64 KB outer block at $8000-$BFFF writes, 16 KB inner at $C000-$FFFF
+    kBankingFme7,         // 69: Sunsoft FME-7: command/parameter, ROM or RAM at $6000, 16-bit CPU-cycle IRQ
+    kBankingNina001,      // 34 with CHR ROM: NINA-001: $7FFD PRG 32 KB, $7FFE/$7FFF CHR 4 KB (and BNROM's $8000 latch)
+    kBankingM15,          // 15: 100-in-1 Contra Function 16: address bits 0-1 pick the PRG mode, data the bank
+    kBankingIrem32,       // 32: Irem G-101: two 8 KB PRG (swappable), 8 x 1 KB CHR
+    kBankingNamco88,      // 88: Namco 108 with CHR A16 forced high for $1000-$1FFF
+    kBankingM91,          // 91: pirate fighters: registers at $6000-$7FFF, 2 KB CHR, 8-scanline IRQ
+    kBankingM42,          // 42: FDS conversions: ROM bank at $6000, last 32 KB fixed, 8 KB CHR, CPU-cycle IRQ
+    kBankingM228,         // 228: Action 52 / Cheetahmen II: address and data latched on $8000-$FFFF, 4 nibbles at $5000
+    kBankingM83,           // 83: Cony/Yoko fighters (FCEUmm yoko.c M83): 8/16 KB PRG, 1/2 KB CHR, 8 KB RAM, CPU-cycle IRQ
+    kBankingJy90,          // 90: JY Company (FCEUmm 90.c): 8 PRG / 4 CHR modes, ALU at $5800, prescaled IRQ
+    kBankingVrc1,          // 75: Konami VRC1: three 8 KB PRG, two 4 KB CHR with a high bit in the mode register
+    kBankingM246,          // 246: Fong Shen Bang: registers at $6000-$67FF, 2 KB RAM at $6800, 8 KB PRG / 2 KB CHR
+    kBankingSa72008,       // 133: Sachen SA72008: register at $4100-$5FFF (A & $100): PRG 32 KB bit 2, CHR 8 KB bits 0-1
+    kBankingM243,          // 243: Sachen S74LS374NA: command/data at $4100/$4101: 32 KB PRG, 8 KB CHR, mirroring
+    kBankingM188,          // 188: Bandai Karaoke Studio: 16 KB PRG at $8000, last fixed; $6000 reads 3; CHR RAM
+    kBankingVrc3,          // 73: Konami VRC3: 16 KB PRG at $8000, 16- or 8-bit CPU-cycle IRQ
+    kBankingM227,          // 227: FC12002R multicart: address latch picks 16/32 KB PRG and mirroring
+    kBankingM8,            // 8: FFE F3xxx: latch at $8000-$FFFF: 16 KB PRG (bits 3+), second 16 KB bank 1, 8 KB CHR (bits 0-1)
+    kBankingCprom,         // 13: CPROM: 16 KB CHR RAM, upper 4 KB switchable; the second 8 KB lives in prg_ram (kChrPageRam)
+    kBankingTaito48,       // 48: Taito TC0690: 8 KB PRG x2, 2 KB + 1 KB CHR, $E000 mirroring, scanline IRQ counting up to $100
+    kBankingJaleco18,      // 18: Jaleco SS88006: nibble-wide 8 KB PRG / 1 KB CHR registers, 16-bit CPU-cycle IRQ
+    kBankingM117,          // 117: Future Media: 8 KB PRG x4, 1 KB CHR x8, scanline IRQ
+    kBankingM222,          // 222: Dragon Ninja pirate: 8 KB PRG x2, 1 KB CHR x8, scanline IRQ up-counter loaded at $F000
+    kBankingBandai16,      // 16: Bandai FCG + 24C02 EEPROM (data in prg_ram): 16 KB PRG, 1 KB CHR, CPU-cycle IRQ
+    kBankingFfe,           // 17 (and 6): FFE as old FCEUmm runs both: $8000 latch 16 KB PRG / 8 KB CHR, $42FE mirroring, $4500 cycle IRQ
+    kBankingN163,          // 19: Namco 163 (old n106.c): 8 KB PRG x3, 1 KB CHR x8, CHR ROM or CIRAM nametables, 15-bit cycle IRQ
+    kBankingSunsoft4,      // 68: Sunsoft-4: 16 KB PRG, 2 KB CHR x4, nametables from CHR ROM pages 128+
+    kBankingMmc5,          // 5: MMC5 (old mmc5.c): PRG/WRAM modes, A/B CHR sets, ExRAM and fill nametables, line IRQ, multiplier
+    kBankingFirstPaged = kBankingCnrom,
 };
 
 struct CpuStateSoA {
@@ -167,32 +240,26 @@ struct PpuStateSoA {
     std::uint8_t* NESLE_RESTRICT nametable_ram;
     std::uint8_t* NESLE_RESTRICT palette_ram;
     std::uint8_t* NESLE_RESTRICT oam;
+    // Frame dot of this frame's next sprite-0 event; 0 = none. With a frame log, bit 31
+    // marks the point (start of sprite 0's first line) where the hit is worked out from
+    // the log, and without it the hit itself. Without a frame log, paged boards keep the
+    // OAM-only hit computed at the pre-render line and the others the coarse line-30 hit.
+    std::uint32_t* NESLE_RESTRICT sprite0_dot;
     // Cartridge CHR RAM (8 KB per env). nullptr for carts that carry CHR ROM,
     // which is every ROM that worked before UxROM support existed; the PPU
     // pattern fetch then never touches this array.
     std::uint8_t* NESLE_RESTRICT chr_ram;
-
-    // Presentation snapshot - frozen at each vblank start so render() sees an
-    // internally consistent picture of the just-finished frame no matter where
-    // stepping paused. All nullptr (host tests, older callers) => render falls
-    // back to live state, the pre-snapshot behavior. `lat_*` latch scroll/ctrl
-    // at the pre-render crossing (frame start); the following vblank promotes
-    // them into `snap_*_start` so start/end pairs always describe one frame.
-    // Two-region rendering uses `snap_*_start` above sprite-0's bottom edge
-    // (SMB's status-bar split) and `snap_*_end` below it.
-    std::uint8_t* NESLE_RESTRICT lat_scroll_x;
-    std::uint8_t* NESLE_RESTRICT lat_scroll_y;
-    std::uint8_t* NESLE_RESTRICT lat_ctrl;
-    std::uint8_t* NESLE_RESTRICT snap_scroll_x_start;
-    std::uint8_t* NESLE_RESTRICT snap_scroll_y_start;
-    std::uint8_t* NESLE_RESTRICT snap_ctrl_start;
-    std::uint8_t* NESLE_RESTRICT snap_scroll_x_end;
-    std::uint8_t* NESLE_RESTRICT snap_scroll_y_end;
-    std::uint8_t* NESLE_RESTRICT snap_ctrl_end;
-    std::uint8_t* NESLE_RESTRICT snap_mask;
+    // Presentation: kFrameLogWords per env (batch_frame.cuh), two banks of frame-start
+    // PPU state plus the PPU-visible writes made while the frame was drawn. The renderer
+    // replays the bank frozen at the last vblank (log_bank bit 0); the step kernel writes
+    // the other one. log_count is the writing bank's event count. All nullptr => render
+    // falls back to live state with no mid-frame writes (host tests, older callers).
+    std::uint32_t* NESLE_RESTRICT frame_log;
+    std::uint16_t* NESLE_RESTRICT log_count;
+    std::uint8_t* NESLE_RESTRICT log_bank;
+    // Nametable RAM and OAM frozen at each vblank, for the renderer.
     std::uint8_t* NESLE_RESTRICT snap_oam;        // kOamBytes per env
     std::uint8_t* NESLE_RESTRICT snap_nametable;  // kNametableRamBytes per env
-    std::uint8_t* NESLE_RESTRICT snap_palette;    // kPaletteRamBytes per env
 };
 
 // Read-only description of the cartridge, shared by every environment in the
@@ -230,6 +297,12 @@ struct CartridgeView {
     std::uint32_t prg_fixed_base;
     std::uint32_t prg_fixed_mask;
     std::uint8_t nametable_arrangement;  // power-on mirroring, from the header
+    // Paged boards only: number of 8 KB PRG pages - 1 and 1 KB CHR pages - 1
+    // (CHR ROM, or the 8 KB of CHR RAM). Both page counts are powers of two.
+    std::uint16_t prg_page_mask;
+    std::uint16_t chr_page_mask;
+    // Bytes per env of MapperStateSoA::ext_ram; 0 = the board has none (every board but MMC5).
+    std::uint32_t ext_ram_bytes;
 };
 
 // Per-environment mapper registers. One byte per env keeps the batch layout
@@ -237,6 +310,17 @@ struct CartridgeView {
 // Absent (nullptr) for NROM, which keeps its zero-indirection read path.
 struct MapperStateSoA {
     std::uint8_t* NESLE_RESTRICT prg_bank;  // switchable PRG window
+    // Paged boards (bank_kind >= kBankingFirstPaged) only; nullptr otherwise.
+    // The page tables are derived from `regs` on every register write, so a
+    // PRG/CHR fetch is one table load plus the ROM load, whatever the board.
+    std::uint32_t* NESLE_RESTRICT prg_page;  // kPrgPages per env: byte offset into PRG ROM
+    std::uint32_t* NESLE_RESTRICT chr_page;  // kChrPages per env: byte offset into CHR ROM/RAM
+    std::uint8_t* NESLE_RESTRICT mirroring;  // per-env nametable page map (kPageMap*)
+    std::uint8_t* NESLE_RESTRICT regs;       // kMapperRegBytes per env
+    // Boards with more memory than the shared arrays hold (cart.ext_ram_bytes per env, else nullptr).
+    // MMC5: [0, $400) ExRAM, [$400, $800) its vblank snapshot, [$800, $840) the CHR registers each log bank
+    // starts from, [$1000, ...) WRAM.
+    std::uint8_t* NESLE_RESTRICT ext_ram;
 };
 
 // The PPU fields read/modified on every emulated instruction. The step kernel
@@ -253,6 +337,36 @@ struct PpuHotState {
     std::uint8_t ctrl = 0;
     std::uint8_t mask = 0;
     std::uint8_t nmi_pending = 0;
+    // Frame log (batch_frame.cuh): frame dot the current instruction started at, the
+    // writing bank's event count, and the presented bank.
+    std::uint32_t now = 0;
+    std::uint16_t log_n = 0;
+    std::uint8_t log_bank = 0;
+};
+
+// The APU's sample channel (DMC), reduced to what changes the game: its
+// status bit ($4015 bit 4, "sample bytes left") and the 4 CPU cycles each
+// sample byte fetch steals, as FCEUmm's DMCDMA does. Tone channels, the frame
+// counter and the IRQ flags are not modelled. Times are absolute CPU cycles
+// (CpuState::cycles). See batch_apu.cuh.
+struct DmcState {
+    std::uint64_t byte_end;   // cycle of the timer's next 8th bit clock, when the
+                              // sample buffer empties (the timer always runs)
+    std::uint16_t bytes_left; // sample bytes still to fetch ($4015 bit 4)
+    std::uint8_t control;     // $4010: bit 6 loop, bits 0-3 rate
+    std::uint8_t length;      // $4013: sample length = length * 16 + 1 bytes
+    std::uint8_t rate;        // rate index byte_end was scheduled with
+    std::uint8_t buffer_full; // a fetched byte waits for the shift register
+};
+
+// Both nullptr = no APU state (host tests, older callers): $4015 reads 0 and
+// no cycles are stolen, the behaviour before the DMC was modelled.
+struct ApuStateSoA {
+    // Cycle at or after which the DMC needs service: 0 = fetch due,
+    // byte_end while a byte is buffered, ~0 when idle. Kept apart from `dmc`
+    // because the step kernel tests it after every instruction.
+    std::uint64_t* NESLE_RESTRICT dmc_event;
+    DmcState* NESLE_RESTRICT dmc;
 };
 
 struct BatchBuffers {
@@ -266,6 +380,10 @@ struct BatchBuffers {
     int* NESLE_RESTRICT previous_mario_x;
     int* NESLE_RESTRICT previous_mario_time;
     std::uint8_t* NESLE_RESTRICT frames_rgb;
+    ApuStateSoA apu;
+    // 1: do not resolve MMC2's latches at vblank; the caller resolves them from the frozen frame log before the next
+    // instruction runs (rl/ runs that replay in its render kernel, where it is ~4x cheaper). 0 = resolve here.
+    std::uint8_t defer_mmc2_resolve = 0;
 };
 
 // Read-only "bank" of N snapshot templates used by snapshot-based env resets. Each top-level
@@ -309,6 +427,11 @@ struct SnapshotTemplate {
     // (mapper 34), and without it a restored env runs on the wrong 16/32 KB bank.
     const std::uint8_t* chr_ram = nullptr;
     const std::uint8_t* cart_latch = nullptr;
+    // Paged boards (CNROM/MMC1/MMC2/MMC3): kMapperRegBytes of board registers per
+    // level in MapperStateSoA::regs layout (fcs::board_registers), and the board's
+    // IRQ line. Null on every other board.
+    const std::uint8_t* mapper_regs = nullptr;
+    const std::uint8_t* irq_line = nullptr;
 
     std::uint32_t num_levels = 0;
 };

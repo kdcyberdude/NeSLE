@@ -2,6 +2,8 @@
 
 #include <cstdint>
 
+#include "nesle/cuda/batch_apu.cuh"
+#include "nesle/cuda/batch_frame.cuh"
 #include "nesle/cuda/mapper.cuh"
 #include "nesle/cuda/state.cuh"
 
@@ -47,9 +49,35 @@ NESLE_CUDA_HD inline std::uint8_t bus_ppu_memory_read(BatchBuffers& buffers,
         if (address >= 0x3000) {
             address = static_cast<std::uint16_t>(address - 0x1000);
         }
+        if constexpr (Mode == kBankModePaged || Mode == kBankModeRuntime) {
+            if (buffers.cart.bank_kind == kBankingMmc5) {  // vnapage: CIRAM 0/1, ExRAM, or the fill page
+                const std::uint32_t m = (buffers.mapper.mirroring[env] >> (2u * ((address >> 10) & 3u))) & 3u;
+                const std::uint8_t* r = paged::regs(buffers, env);
+                if (m == 2u) return paged::mmc5_ext(buffers, env)[kMmc5ExRam + (address & 0x3FFu)];
+                if (m == 3u) {
+                    if ((address & 0x3FFu) < 0x3C0u) return r[paged::kM5NtFill];
+                    const std::uint32_t at = r[paged::kM5AtFill] & 3u;
+                    return static_cast<std::uint8_t>(at | (at << 2) | (at << 4) | (at << 6));
+                }
+                return buffers.ppu.nametable_ram[static_cast<std::uint64_t>(env) * kNametableRamBytes + (m << 10) +
+                                                 (address & 0x3FFu)];
+            }
+            if (cart_is_paged<Mode>(buffers.cart) && (buffers.mapper.mirroring[env] & kPageMapNtChr) != 0) {
+                const std::uint32_t q = (address >> 10) & 3u;
+                if (((buffers.mapper.mirroring[env] >> (4u + q)) & 1u) != 0) {
+                    const std::uint8_t* r = paged::regs(buffers, env);
+                    const std::uint32_t page = r[kNtChrPage + q] |
+                        (buffers.cart.bank_kind == kBankingJy90 ? ((r[paged::kJyNtHi] >> q) & 1u) << 8 : 0u);
+                    return buffers.cart.chr_rom[((page << 10) | (address & 0x3FFu)) % buffers.cart.chr_rom_size];
+                }
+            }
+        }
+        if ((address & 0x800u) != 0 && four_screen_ram(buffers)) {  // nametables 2-3
+            return buffers.mapper.ext_ram[static_cast<std::uint64_t>(env) * buffers.cart.ext_ram_bytes + kFourScreenLive +
+                                          (address & 0x7FFu)];
+        }
         return buffers.ppu.nametable_ram[static_cast<std::uint64_t>(env) * kNametableRamBytes +
-                                        mirror_nametable_address(
-                                            env_nametable_arrangement<Mode>(buffers, env), address)];
+                                        env_mirror_nametable_address<Mode>(buffers, env, address)];
     }
     return buffers.ppu.palette_ram[
         static_cast<std::uint64_t>(env) * kPaletteRamBytes + bus_mirror_palette_address(address)];
@@ -62,20 +90,130 @@ NESLE_CUDA_HD inline void bus_ppu_memory_write(BatchBuffers& buffers,
                                                std::uint8_t value) {
     address = static_cast<std::uint16_t>(address & 0x3FFF);
     if (address < 0x2000) {
-        write_chr(buffers, env, address, value);
+        write_chr<Mode>(buffers, env, address, value);
         return;
     }
     if (address < 0x3F00) {
         if (address >= 0x3000) {
             address = static_cast<std::uint16_t>(address - 0x1000);
         }
+        if constexpr (Mode == kBankModePaged || Mode == kBankModeRuntime) {
+            if (buffers.cart.bank_kind == kBankingMmc5) {
+                const std::uint32_t m = (buffers.mapper.mirroring[env] >> (2u * ((address >> 10) & 3u))) & 3u;
+                if (m == 2u) paged::mmc5_ext(buffers, env)[kMmc5ExRam + (address & 0x3FFu)] = value;
+                if (m < 2u) {
+                    buffers.ppu.nametable_ram[static_cast<std::uint64_t>(env) * kNametableRamBytes + (m << 10) +
+                                              (address & 0x3FFu)] = value;
+                }
+                return;  // the fill page is read-only
+            }
+            if (cart_is_paged<Mode>(buffers.cart) &&
+                ((buffers.mapper.mirroring[env] >> (4u + ((address >> 10) & 3u))) & 1u) != 0) {
+                return;  // a CHR ROM nametable
+            }
+        }
+        if ((address & 0x800u) != 0 && four_screen_ram(buffers)) {  // nametables 2-3
+            buffers.mapper.ext_ram[static_cast<std::uint64_t>(env) * buffers.cart.ext_ram_bytes + kFourScreenLive +
+                                   (address & 0x7FFu)] = value;
+            return;
+        }
         buffers.ppu.nametable_ram[static_cast<std::uint64_t>(env) * kNametableRamBytes +
-                                  mirror_nametable_address(
-                                      env_nametable_arrangement<Mode>(buffers, env), address)] = value;
+                                  env_mirror_nametable_address<Mode>(buffers, env, address)] = value;
         return;
     }
     buffers.ppu.palette_ram[static_cast<std::uint64_t>(env) * kPaletteRamBytes +
                             bus_mirror_palette_address(address)] = value;
+}
+
+// The VRAM address the CPU puts on the PPU bus ($2006/$2007): MMC2 latch flips, logged
+// for the renderer while a frame is drawn.
+template <BankMode Mode = kBankModeRuntime>
+NESLE_CUDA_HD inline void bus_ppu_address(BatchBuffers& buffers,
+                                          std::uint32_t env,
+                                          std::uint16_t address,
+                                          PpuHotState* hot) {
+    if constexpr (Mode == kBankModePaged || Mode == kBankModeRuntime) {
+        if (buffers.cart.bank_kind == kBankingMmc2 && buffers.mapper.regs != nullptr) {
+            const std::uint8_t* r = paged::regs(buffers, env);
+            const std::uint8_t latch0 = r[paged::kMmc2Latch0];
+            const std::uint8_t latch1 = r[paged::kMmc2Latch1];
+            paged::mmc2_ppu_address(buffers, env, address);
+            if (r[paged::kMmc2Latch0] != latch0) {
+                frame_log_event(buffers, env, hot, kEvMmc2, r[paged::kMmc2Latch0], paged::kMmc2Latch0);
+            }
+            if (r[paged::kMmc2Latch1] != latch1) {
+                frame_log_event(buffers, env, hot, kEvMmc2, r[paged::kMmc2Latch1], paged::kMmc2Latch1);
+            }
+        }
+    }
+}
+
+// A board register write. While a frame is drawn, the CHR pages, mirroring and MMC2
+// CHR registers it changes are logged for the renderer.
+template <BankMode Mode = kBankModeRuntime>
+NESLE_CUDA_HD inline void bus_write_mapper(BatchBuffers& buffers,
+                                           std::uint32_t env,
+                                           std::uint16_t address,
+                                           std::uint8_t value,
+                                           PpuHotState* hot) {
+    if constexpr (Mode == kBankModePaged || Mode == kBankModeRuntime) {
+        if (buffers.cart.bank_kind == kBankingM222) {  // M222Write reads FCEUmm's scanline (< 240: visible)
+            const std::uint32_t dot = hot != nullptr ? hot->frame_dot : buffers.ppu.frame_dot[env];
+            paged::regs(buffers, env)[13] = dot < 240u * 341u ? 1 : 0;  // 341 dots per line
+        }
+        if (cart_is_paged<Mode>(buffers.cart) && frame_log_active(buffers, hot)) {
+            const std::uint32_t* pages = buffers.mapper.chr_page + static_cast<std::uint64_t>(env) * kChrPages;
+            const std::uint8_t* r = paged::regs(buffers, env);
+            std::uint32_t before[8];
+            for (int i = 0; i < 8; ++i) before[i] = pages[i];
+            const std::uint8_t mirroring = buffers.mapper.mirroring[env];
+            const std::uint32_t creg = r[0] | (r[1] << 8) | (r[2] << 16) | (static_cast<std::uint32_t>(r[3]) << 24);
+            std::uint8_t nt_before[4];
+            for (std::uint32_t q = 0; q < 4u; ++q) nt_before[q] = r[kNtChrPage + q];
+            const std::uint8_t nt_hi = buffers.cart.bank_kind == kBankingJy90 ? r[paged::kJyNtHi] : 0;
+            std::uint8_t m5_before[24] = {};  // MMC5: CHR banks A/B (low, high) and vsize
+            if (buffers.cart.bank_kind == kBankingMmc5) {
+                for (std::uint32_t i = 0; i < 24u; ++i) m5_before[i] = r[paged::kM5ALo + i];
+            }
+            const std::uint8_t m5_vsize = r[paged::kM5VSize], m5_ab = r[paged::kM5AB],
+                               m5_mode = r[paged::kM5ChrMode], m5_hi = r[paged::kM5Hi];
+            write_mapper_register<Mode>(buffers, env, address, value);
+            for (std::uint32_t i = 0; i < 8u; ++i) {
+                if (pages[i] != before[i]) frame_log_event(buffers, env, hot, kEvChr, (pages[i] >> 10) & 0xFFu,
+                                                                i | (((pages[i] >> 18) & 3u) << 3) | ((pages[i] >> 31) << 5));
+            }
+            if (buffers.mapper.mirroring[env] != mirroring) {
+                frame_log_event(buffers, env, hot, kEvMirror, buffers.mapper.mirroring[env]);
+            }
+            if (buffers.cart.bank_kind == kBankingMmc2) {
+                for (std::uint32_t i = 0; i < 4u; ++i) {
+                    if (r[i] != ((creg >> (8u * i)) & 0xFFu)) frame_log_event(buffers, env, hot, kEvMmc2, r[i], i);
+                }
+            } else {
+                for (std::uint32_t q = 0; q < 4u; ++q) {
+                    const std::uint32_t hi = buffers.cart.bank_kind == kBankingJy90 ? (r[paged::kJyNtHi] >> q) & 1u : 0u;
+                    if (r[kNtChrPage + q] != nt_before[q] || hi != ((nt_hi >> q) & 1u)) {
+                        frame_log_event(buffers, env, hot, kEvNtChr, r[kNtChrPage + q], q | (hi << 2));
+                    }
+                }
+            }
+            if (buffers.cart.bank_kind == kBankingMmc5) {  // kEvMmc5: aux = bank 0-7 A, 8-11 B, 12 vsize | bits 8-9 << 4
+                for (std::uint32_t i = 0; i < 12u; ++i) {
+                    const std::uint32_t lo = i < 8u ? paged::kM5ALo + i : paged::kM5BLo + i - 8u;
+                    const std::uint32_t hi = lo + (i < 8u ? 8u : 4u);
+                    if (r[lo] != m5_before[lo - paged::kM5ALo] || r[hi] != m5_before[hi - paged::kM5ALo]) {
+                        frame_log_event(buffers, env, hot, kEvMmc5, r[lo], i | ((r[hi] & 3u) << 4));
+                    }
+                }
+                if (r[paged::kM5VSize] != m5_vsize) frame_log_event(buffers, env, hot, kEvMmc5, r[paged::kM5VSize], 12u);
+                if (r[paged::kM5AB] != m5_ab) frame_log_event(buffers, env, hot, kEvMmc5, r[paged::kM5AB], 13u);
+                if (r[paged::kM5ChrMode] != m5_mode) frame_log_event(buffers, env, hot, kEvMmc5, r[paged::kM5ChrMode], 14u);
+                if (r[paged::kM5Hi] != m5_hi) frame_log_event(buffers, env, hot, kEvMmc5, r[paged::kM5Hi], 15u);
+            }
+            return;
+        }
+    }
+    write_mapper_register<Mode>(buffers, env, address, value);
 }
 
 NESLE_CUDA_HD inline void bus_increment_vram_address(BatchBuffers& buffers,
@@ -172,15 +310,22 @@ NESLE_CUDA_HD inline std::uint8_t batch_cpu_read(BatchBuffers& buffers,
                 value = bus_ppu_memory_read<Mode>(buffers, env, ppu_address);
                 buffers.ppu.read_buffer[env] =
                     bus_ppu_memory_read<Mode>(buffers, env, static_cast<std::uint16_t>(ppu_address - 0x1000));
+                bus_ppu_address<Mode>(buffers, env, ppu_address, hot);
             } else {
                 value = buffers.ppu.read_buffer[env];
+                bus_ppu_address<Mode>(buffers, env, ppu_address, hot);
                 buffers.ppu.read_buffer[env] = bus_ppu_memory_read<Mode>(buffers, env, ppu_address);
             }
             bus_increment_vram_address(buffers, env, hot);
+            frame_log_event(buffers, env, hot, kEvDataRead, 0);
+            bus_ppu_address<Mode>(buffers, env, static_cast<std::uint16_t>(buffers.ppu.v[env] & 0x3FFF), hot);
             buffers.ppu.open_bus[env] = value;
             return value;
         }
         return 0;
+    }
+    if (address == 0x4015) {
+        return read_apu_status(buffers, env);
     }
     if (address == 0x4016) {
         return read_controller1(buffers, env);
@@ -190,10 +335,27 @@ NESLE_CUDA_HD inline std::uint8_t batch_cpu_read(BatchBuffers& buffers,
         return 0x40;
     }
     if (address >= 0x6000 && address < 0x8000) {
+        if constexpr (Mode == kBankModePaged || Mode == kBankModeRuntime) {
+            std::uint8_t rom_byte;
+            if (buffers.mapper.regs != nullptr && paged::read_6000_rom(buffers, env, address, rom_byte)) {
+                return rom_byte;
+            }
+        }
+        if (!mapper_prg_ram_enabled<Mode>(buffers, env)) {
+            // Disabled board RAM: open bus, which after an absolute or indirect
+            // fetch still holds the address high byte.
+            return static_cast<std::uint8_t>(address >> 8);
+        }
         return env_prg_ram(buffers, env)[address - 0x6000];
     }
     if (address >= 0x8000) {
         return read_prg<Mode>(buffers, env, address);
+    }
+    if constexpr (Mode == kBankModePaged || Mode == kBankModeRuntime) {
+        std::uint8_t value;
+        if (address >= 0x4020 && buffers.mapper.regs != nullptr && paged::read_expansion(buffers, env, address, value)) {
+            return value;
+        }
     }
     return 0;
 }
@@ -227,18 +389,21 @@ NESLE_CUDA_HD inline void batch_cpu_write(BatchBuffers& buffers,
             }
             buffers.ppu.t[env] =
                 static_cast<std::uint16_t>((buffers.ppu.t[env] & 0xF3FF) | ((value & 0x03) << 10));
+            frame_log_event(buffers, env, hot, kEvCtrl, value);
         } else if (reg == 1) {
             if (hot != nullptr) {
                 hot->mask = value;
             } else {
                 buffers.ppu.mask[env] = value;
             }
+            frame_log_event(buffers, env, hot, kEvMask, value);
         } else if (reg == 3) {
             buffers.ppu.oam_addr[env] = value;
         } else if (reg == 4) {
             env_oam(buffers, env)[buffers.ppu.oam_addr[env]] = value;
             ++buffers.ppu.oam_addr[env];
         } else if (reg == 5) {
+            frame_log_event(buffers, env, hot, kEvScroll, value, buffers.ppu.w[env]);
             if (buffers.ppu.w[env] == 0) {
                 if (buffers.ppu.x != nullptr) {
                     buffers.ppu.x[env] = static_cast<std::uint8_t>(value & 0x07);
@@ -260,6 +425,7 @@ NESLE_CUDA_HD inline void batch_cpu_write(BatchBuffers& buffers,
                 buffers.ppu.w[env] = 0;
             }
         } else if (reg == 6) {
+            frame_log_event(buffers, env, hot, kEvAddr, value, buffers.ppu.w[env]);
             if (buffers.ppu.w[env] == 0) {
                 buffers.ppu.t[env] =
                     static_cast<std::uint16_t>((buffers.ppu.t[env] & 0x00FF) | ((value & 0x3F) << 8));
@@ -269,10 +435,18 @@ NESLE_CUDA_HD inline void batch_cpu_write(BatchBuffers& buffers,
                     static_cast<std::uint16_t>((buffers.ppu.t[env] & 0x7F00) | value);
                 buffers.ppu.v[env] = buffers.ppu.t[env];
                 buffers.ppu.w[env] = 0;
+                bus_ppu_address<Mode>(buffers, env, buffers.ppu.v[env], hot);
             }
         } else if (reg == 7) {
+            const auto ppu_address = static_cast<std::uint16_t>(buffers.ppu.v[env] & 0x3FFF);
             bus_ppu_memory_write<Mode>(buffers, env, buffers.ppu.v[env], value);
+            if (ppu_address >= 0x3F00) {
+                frame_log_event(buffers, env, hot, kEvPalette, value, bus_mirror_palette_address(ppu_address));
+            } else {
+                frame_log_event(buffers, env, hot, kEvDataWrite, 0);
+            }
             bus_increment_vram_address(buffers, env, hot);
+            bus_ppu_address<Mode>(buffers, env, static_cast<std::uint16_t>(buffers.ppu.v[env] & 0x3FFF), hot);
         }
         buffers.ppu.open_bus[env] = value;
         return;
@@ -285,12 +459,33 @@ NESLE_CUDA_HD inline void batch_cpu_write(BatchBuffers& buffers,
         write_controller_strobe(buffers, env, value);
         return;
     }
+    if (address == 0x4010 || address == 0x4013 || address == 0x4015) {
+        write_apu_register(buffers, env, address, value);
+        return;
+    }
     if (address >= 0x6000 && address < 0x8000) {
-        env_prg_ram(buffers, env)[address - 0x6000] = value;
+        if (mapper_prg_ram_enabled<Mode>(buffers, env)) {
+            env_prg_ram(buffers, env)[address - 0x6000] = value;
+        }
+        if constexpr (Mode == kBankModePaged || Mode == kBankModeRuntime) {
+            if (buffers.cart.bank_kind > kBankingMmc3 || buffers.cart.mapper == 189 || buffers.cart.mapper == 187 ||
+                buffers.cart.mapper == 182 || buffers.cart.mapper == 114 || buffers.cart.mapper == 47) {  // boards with a register in $6000-$7FFF
+                bus_write_mapper<Mode>(buffers, env, address, value, hot);
+            }
+        }
         return;
     }
     if (address >= 0x8000) {
-        write_mapper_register<Mode>(buffers, env, address, value);
+        bus_write_mapper<Mode>(buffers, env, address, value, hot);
+        return;
+    }
+    if (address >= 0x4020) {
+        if constexpr (Mode == kBankModePaged || Mode == kBankModeRuntime) {
+            if (buffers.cart.bank_kind > kBankingMmc3 || buffers.cart.mapper == 189 || buffers.cart.mapper == 187 ||
+                buffers.cart.mapper == 182 || buffers.cart.mapper == 114 || buffers.cart.mapper == 121) {  // expansion-area registers ($4100 NINA-03/06, $4120 189, ...)
+                bus_write_mapper<Mode>(buffers, env, address, value, hot);
+            }
+        }
     }
 }
 

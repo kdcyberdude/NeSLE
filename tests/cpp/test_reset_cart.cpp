@@ -298,9 +298,47 @@ void test_latch_is_masked() {
     assert(fixture.prg_bank[0] == (0xFA & 7));
 }
 
+// Paged boards resume from the registers in their board chunks: MMC3's banks,
+// mirroring, IRQ counter state and the IRQ line come back, not power-on values.
+void test_mmc3_restores_board_registers() {
+    Fixture fixture(4, 0, 0, 0);
+    std::vector<std::uint32_t> prg_page(kNumEnvs * nesle::cuda::kPrgPages, 0);
+    std::vector<std::uint32_t> chr_page(kNumEnvs * nesle::cuda::kChrPages, 0);
+    std::vector<std::uint8_t> mirroring(kNumEnvs, 0);
+    std::vector<std::uint8_t> regs(kNumEnvs * nesle::cuda::kMapperRegBytes, 0);
+    fixture.buffers.mapper.prg_page = prg_page.data();
+    fixture.buffers.mapper.chr_page = chr_page.data();
+    fixture.buffers.mapper.mirroring = mirroring.data();
+    fixture.buffers.mapper.regs = regs.data();
+    fixture.buffers.cart.bank_kind = nesle::cuda::kBankingMmc3;
+    fixture.buffers.cart.nametable_arrangement = nesle::cuda::kNametableVertical;
+    fixture.buffers.cart.prg_page_mask = 15;   // 128 KB PRG
+    fixture.buffers.cart.chr_page_mask = 127;  // 128 KB CHR
+
+    std::vector<std::uint8_t> saved(kNumLevels * nesle::cuda::kMapperRegBytes, 0);
+    const std::uint8_t level1[15] = {0, 0x3A, 0x4A, 0x5D, 0x6E, 0x61, 0x0A, 0x04,  // R0-R7
+                                     0x46, 1, 0x80, 9, 7, 1, 0};                     // select..reload
+    for (int i = 0; i < 15; ++i) saved[nesle::cuda::kMapperRegBytes + i] = level1[i];
+    std::vector<std::uint8_t> irq_line = {0, 1};
+    fixture.snap.mapper_regs = saved.data();
+    fixture.snap.irq_line = irq_line.data();
+    fixture.env_to_level[0] = 1;
+
+    fixture.reset_env(0);
+    for (int i = 0; i < 15; ++i) assert(regs[i] == level1[i]);
+    assert(fixture.cpu_irq[0] == 1);
+    assert(mirroring[0] == nesle::cuda::kPageMapHorizontal);  // A000 bit 0
+    // Bank select 0x46: PRG mode 1 puts R6 at $C000 and the second-last page at $8000.
+    assert(prg_page[2] == (0x0Au << 13) && prg_page[0] == ((0x7Eu & 15u) << 13));
+    assert(prg_page[1] == (0x04u << 13) && prg_page[3] == (15u << 13));
+    assert(chr_page[4] == (0x4Au << 10) && chr_page[7] == (0x61u << 10));  // R2..R5, no CHR swap
+    assert(chr_page[2] == (0x3Au << 10) && chr_page[3] == (0x3Bu << 10));  // R1 as a 2 KB bank
+}
+
 }  // namespace
 
 int main() {
+    test_mmc3_restores_board_registers();
     test_uxrom_restores_bank();
     test_un1rom_shift_is_applied();
     test_bnrom_restores_page();

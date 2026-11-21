@@ -4,9 +4,11 @@
 #include <pybind11/stl.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include <optional>
@@ -1068,6 +1070,10 @@ private:
         // reported as a fault that never happened.
         device_fault_pending_ =
             cuda_alloc_zeroed<std::uint32_t>(num_env_, "cudaMalloc env fault pending");
+        // DMC sample channel ($4015 status, fetch cycles; batch_apu.cuh). All-zero
+        // is a valid idle state; reset_console() uploads the power-on one.
+        device_dmc_event_ = cuda_alloc_zeroed<std::uint64_t>(num_env_, "cudaMalloc dmc event");
+        device_dmc_ = cuda_alloc_zeroed<nesle::cuda::DmcState>(num_env_, "cudaMalloc dmc");
         device_previous_x_ = cuda_alloc<int>(num_env_, "cudaMalloc previous_x");
         device_previous_time_ = cuda_alloc<int>(num_env_, "cudaMalloc previous_time");
         device_rewards_ = cuda_alloc<float>(num_env_, "cudaMalloc rewards");
@@ -1104,6 +1110,18 @@ private:
         // The bank register lives per environment, not per cartridge, because
         // every env in a batch runs the same game with a different bank.
         device_prg_bank_ = cuda_alloc<std::uint8_t>(num_env_, "cudaMalloc prg bank");
+        if (nesle::describe_mapper(rom_.metadata).bank_kind >= nesle::kBankKindCnrom) {
+            // Paged boards (CNROM/MMC1/MMC2/MMC3): per-env page tables, board
+            // registers and runtime mirroring.
+            const auto envs = static_cast<std::size_t>(num_env_);
+            device_prg_page_ = cuda_alloc<std::uint32_t>(envs * nesle::cuda::kPrgPages, "cudaMalloc prg pages");
+            device_chr_page_ = cuda_alloc<std::uint32_t>(envs * nesle::cuda::kChrPages, "cudaMalloc chr pages");
+            device_mirroring_ = cuda_alloc<std::uint8_t>(envs, "cudaMalloc mirroring");
+            device_mapper_regs_ =
+                cuda_alloc<std::uint8_t>(envs * nesle::cuda::kMapperRegBytes, "cudaMalloc mapper regs");
+        }
+        // Every board: the frame dot of the next sprite-0 event (batch_ppu.cuh).
+        device_sprite0_dot_ = cuda_alloc_zeroed<std::uint32_t>(num_env_, "cudaMalloc sprite0 dot");
         device_palette_ = cuda_alloc<std::uint8_t>(
             static_cast<std::size_t>(num_env_) * nesle::cuda::kPaletteRamBytes,
             "cudaMalloc palette");
@@ -1113,25 +1131,17 @@ private:
         device_frames_ = cuda_alloc<std::uint8_t>(
             static_cast<std::size_t>(num_env_) * kFrameBytes,
             "cudaMalloc frames");
-        // Presentation snapshot buffers (frozen at vblank; see batch_ppu.cuh).
-        device_lat_scroll_x_ = cuda_alloc<std::uint8_t>(num_env_, "cudaMalloc lat scroll x");
-        device_lat_scroll_y_ = cuda_alloc<std::uint8_t>(num_env_, "cudaMalloc lat scroll y");
-        device_lat_ctrl_ = cuda_alloc<std::uint8_t>(num_env_, "cudaMalloc lat ctrl");
-        device_snap_scroll_x_start_ = cuda_alloc<std::uint8_t>(num_env_, "cudaMalloc snap scroll x start");
-        device_snap_scroll_y_start_ = cuda_alloc<std::uint8_t>(num_env_, "cudaMalloc snap scroll y start");
-        device_snap_ctrl_start_ = cuda_alloc<std::uint8_t>(num_env_, "cudaMalloc snap ctrl start");
-        device_snap_scroll_x_end_ = cuda_alloc<std::uint8_t>(num_env_, "cudaMalloc snap scroll x end");
-        device_snap_scroll_y_end_ = cuda_alloc<std::uint8_t>(num_env_, "cudaMalloc snap scroll y end");
-        device_snap_ctrl_end_ = cuda_alloc<std::uint8_t>(num_env_, "cudaMalloc snap ctrl end");
-        device_snap_mask_ = cuda_alloc<std::uint8_t>(num_env_, "cudaMalloc snap mask");
+        // Presentation: the frame logs (batch_frame.cuh) and the nametable RAM and OAM
+        // frozen at vblank.
+        device_frame_log_ = cuda_alloc<std::uint32_t>(
+            static_cast<std::size_t>(num_env_) * nesle::cuda::kFrameLogWords, "cudaMalloc frame log");
+        device_log_count_ = cuda_alloc_zeroed<std::uint16_t>(num_env_, "cudaMalloc log count");
+        device_log_bank_ = cuda_alloc_zeroed<std::uint8_t>(num_env_, "cudaMalloc log bank");
         device_snap_oam_ = cuda_alloc<std::uint8_t>(
             static_cast<std::size_t>(num_env_) * nesle::cuda::kOamBytes, "cudaMalloc snap oam");
         device_snap_nametable_ = cuda_alloc<std::uint8_t>(
             static_cast<std::size_t>(num_env_) * nesle::cuda::kNametableRamBytes,
             "cudaMalloc snap nametable");
-        device_snap_palette_ = cuda_alloc<std::uint8_t>(
-            static_cast<std::size_t>(num_env_) * nesle::cuda::kPaletteRamBytes,
-            "cudaMalloc snap palette");
         device_reset_mask_ = cuda_alloc<std::uint8_t>(num_env_, "cudaMalloc reset mask");
         device_stat_instructions_ =
             cuda_alloc<std::uint64_t>(num_env_, "cudaMalloc stat instructions");
@@ -1161,6 +1171,8 @@ private:
         buffers_.cpu.pending_dma_cycles = device_pending_dma_cycles_;
         buffers_.cpu.fault = device_fault_;
         buffers_.cpu.fault_pending = device_fault_pending_;
+        buffers_.apu.dmc_event = device_dmc_event_;
+        buffers_.apu.dmc = device_dmc_;
         buffers_.action_masks = device_actions_;
         buffers_.previous_mario_x = device_previous_x_;
         buffers_.previous_mario_time = device_previous_time_;
@@ -1184,19 +1196,12 @@ private:
         buffers_.ppu.nametable_ram = device_nametable_;
         buffers_.ppu.palette_ram = device_palette_;
         buffers_.ppu.oam = device_oam_;
-        buffers_.ppu.lat_scroll_x = device_lat_scroll_x_;
-        buffers_.ppu.lat_scroll_y = device_lat_scroll_y_;
-        buffers_.ppu.lat_ctrl = device_lat_ctrl_;
-        buffers_.ppu.snap_scroll_x_start = device_snap_scroll_x_start_;
-        buffers_.ppu.snap_scroll_y_start = device_snap_scroll_y_start_;
-        buffers_.ppu.snap_ctrl_start = device_snap_ctrl_start_;
-        buffers_.ppu.snap_scroll_x_end = device_snap_scroll_x_end_;
-        buffers_.ppu.snap_scroll_y_end = device_snap_scroll_y_end_;
-        buffers_.ppu.snap_ctrl_end = device_snap_ctrl_end_;
-        buffers_.ppu.snap_mask = device_snap_mask_;
+        buffers_.ppu.frame_log = device_frame_log_;
+        buffers_.ppu.log_count = device_log_count_;
+        buffers_.ppu.log_bank = device_log_bank_;
+        buffers_.ppu.sprite0_dot = device_sprite0_dot_;
         buffers_.ppu.snap_oam = device_snap_oam_;
         buffers_.ppu.snap_nametable = device_snap_nametable_;
-        buffers_.ppu.snap_palette = device_snap_palette_;
         buffers_.frames_rgb = device_frames_;
     }
 
@@ -1218,6 +1223,8 @@ private:
         cudaFree(device_pending_dma_cycles_);
         cudaFree(device_fault_);
         cudaFree(device_fault_pending_);
+        cudaFree(device_dmc_event_);
+        cudaFree(device_dmc_);
         cudaFree(device_previous_x_);
         cudaFree(device_previous_time_);
         cudaFree(device_rewards_);
@@ -1244,23 +1251,20 @@ private:
         cudaFree(device_nametable_);
         cudaFree(device_palette_);
         cudaFree(device_oam_);
-        cudaFree(device_lat_scroll_x_);
-        cudaFree(device_lat_scroll_y_);
-        cudaFree(device_lat_ctrl_);
-        cudaFree(device_snap_scroll_x_start_);
-        cudaFree(device_snap_scroll_y_start_);
-        cudaFree(device_snap_ctrl_start_);
-        cudaFree(device_snap_scroll_x_end_);
-        cudaFree(device_snap_scroll_y_end_);
-        cudaFree(device_snap_ctrl_end_);
-        cudaFree(device_snap_mask_);
+        cudaFree(device_frame_log_);
+        cudaFree(device_log_count_);
+        cudaFree(device_log_bank_);
         cudaFree(device_snap_oam_);
         cudaFree(device_snap_nametable_);
-        cudaFree(device_snap_palette_);
         cudaFree(device_prg_rom_);
         cudaFree(device_chr_rom_);
         cudaFree(device_chr_ram_);
         cudaFree(device_prg_bank_);
+        cudaFree(device_prg_page_);
+        cudaFree(device_chr_page_);
+        cudaFree(device_mirroring_);
+        cudaFree(device_mapper_regs_);
+        cudaFree(device_sprite0_dot_);
         cudaFree(device_frames_);
         cudaFree(device_reset_mask_);
         cudaFree(device_stat_instructions_);
@@ -1275,6 +1279,8 @@ private:
         cudaFree(device_snapshot_oam_);
         cudaFree(device_snapshot_chr_ram_);
         cudaFree(device_snap_cart_latch_);
+        cudaFree(device_snap_mapper_regs_);
+        cudaFree(device_snap_irq_line_);
         cudaFree(device_snap_pc_);
         cudaFree(device_snap_a_);
         cudaFree(device_snap_x_);
@@ -1357,6 +1363,50 @@ private:
         const std::vector<std::uint8_t> zero(static_cast<std::size_t>(num_env_), 0);
         copy_to_device(device_prg_bank_, zero, "copy prg bank");
         buffers_.mapper.prg_bank = device_prg_bank_;
+
+        buffers_.cart.prg_page_mask = layout.prg_page_mask;
+        buffers_.cart.chr_page_mask = layout.chr_page_mask;
+        buffers_.mapper.prg_page = device_prg_page_;
+        buffers_.mapper.chr_page = device_chr_page_;
+        buffers_.mapper.mirroring = device_mirroring_;
+        buffers_.mapper.regs = device_mapper_regs_;
+        upload_paged_power_on();
+    }
+
+    // Paged boards: power-on registers and page tables for every env. Worked
+    // out once on the host with the same reset_mapper_state the device runs.
+    void upload_paged_power_on() {
+        if (device_mapper_regs_ == nullptr) {
+            return;
+        }
+        std::vector<std::uint32_t> prg_page(nesle::cuda::kPrgPages);
+        std::vector<std::uint32_t> chr_page(nesle::cuda::kChrPages);
+        std::vector<std::uint8_t> mirroring(1);
+        std::vector<std::uint8_t> regs(nesle::cuda::kMapperRegBytes);
+        std::vector<std::uint8_t> irq(1);
+        nesle::cuda::BatchBuffers host{};
+        host.cart = buffers_.cart;
+        host.mapper.prg_page = prg_page.data();
+        host.mapper.chr_page = chr_page.data();
+        host.mapper.mirroring = mirroring.data();
+        host.mapper.regs = regs.data();
+        host.cpu.irq_pending = irq.data();
+        nesle::cuda::reset_mapper_state(host, 0);
+
+        const auto envs = static_cast<std::size_t>(num_env_);
+        auto repeat = [envs](const auto& one) {
+            std::remove_cv_t<std::remove_reference_t<decltype(one)>> all;
+            all.reserve(envs * one.size());
+            for (std::size_t i = 0; i < envs; ++i) {
+                all.insert(all.end(), one.begin(), one.end());
+            }
+            return all;
+        };
+        copy_to_device(device_prg_page_, repeat(prg_page), "copy prg pages");
+        copy_to_device(device_chr_page_, repeat(chr_page), "copy chr pages");
+        copy_to_device(device_mirroring_, repeat(mirroring), "copy mirroring");
+        copy_to_device(device_mapper_regs_, repeat(regs), "copy mapper regs");
+        copy_to_device(device_sprite0_dot_, std::vector<std::uint32_t>(envs, 0), "reset sprite0 dot");
     }
 
     void reset_console() {
@@ -1427,6 +1477,16 @@ private:
         copy_to_device(device_nametable_, nametable, "reset nametable");
         copy_to_device(device_palette_, palette, "reset palette");
         copy_to_device(device_oam_, oam, "reset oam");
+        // DMC power-on, from the same reset_dmc_env the reset kernel runs.
+        nesle::cuda::DmcState dmc{};
+        std::uint64_t dmc_event = 0;
+        nesle::cuda::BatchBuffers host{};
+        host.apu.dmc = &dmc;
+        host.apu.dmc_event = &dmc_event;
+        nesle::cuda::reset_dmc_env(host, 0, 7);
+        copy_to_device(device_dmc_, std::vector<nesle::cuda::DmcState>(env_count, dmc), "reset dmc");
+        copy_to_device(device_dmc_event_, std::vector<std::uint64_t>(env_count, dmc_event), "reset dmc event");
+        upload_paged_power_on();
     }
 
 
@@ -1434,8 +1494,31 @@ private:
     // the right 16 KB window only by accident. FCEUX writes "LATC" for mappers
     // 2/94 and "REGS"[0] for mapper 34, so a missing tag means the state did not
     // come from FCEUX, or came from a build that does not save it.
-    void require_cart_latch() const {
+    void require_cart_latch() {
         const auto layout = nesle::describe_mapper(rom_.metadata);
+        if (layout.bank_kind >= nesle::kBankKindCnrom && !snapshots_.empty()) {
+            // CNROM/MMC1/MMC2/MMC3 resume from the registers in their FCEUmm board
+            // chunks (LATC; DREG/BFFR/BFRS; CREG/PREG/MIRR/LAT0/LAT1; REGS/CMD/
+            // A000/A001/IRQ*). A state without them would resume on power-on banks.
+            snap_board_regs_.assign(snapshots_.size() * nesle::cuda::kMapperRegBytes, 0);
+            snap_irq_line_.assign(snapshots_.size(), 0);
+            for (std::size_t i = 0; i < snapshots_.size(); ++i) {
+                std::array<std::uint8_t, nesle::cuda::kMapperRegBytes> regs{};
+                std::uint8_t irq = 0;
+                if (!nesle::fcs::board_registers(snapshots_[i], layout.bank_kind, regs, irq)) {
+                    throw std::invalid_argument(
+                        "reset state " + std::to_string(i) + " has no " +
+                        nesle::to_string(rom_.metadata.mapper) +
+                        " board registers; a paged cartridge cannot resume from it without "
+                        "running the wrong PRG/CHR banks");
+                }
+                std::copy(regs.begin(), regs.end(),
+                          snap_board_regs_.begin() +
+                              static_cast<std::ptrdiff_t>(i * nesle::cuda::kMapperRegBytes));
+                snap_irq_line_[i] = irq;
+            }
+            return;
+        }
         if (layout.window_bytes == 0) {
             return;  // NROM: no bank register, nothing to restore
         }
@@ -1574,6 +1657,14 @@ private:
 
         snapshot_template_.chr_ram = device_snapshot_chr_ram_;
         snapshot_template_.cart_latch = any_cart_latch ? device_snap_cart_latch_ : nullptr;
+        if (!snap_board_regs_.empty()) {
+            device_snap_mapper_regs_ = cuda_alloc<std::uint8_t>(snap_board_regs_.size(), "snap mapper regs");
+            device_snap_irq_line_ = cuda_alloc<std::uint8_t>(snap_irq_line_.size(), "snap irq line");
+            copy_to_device(device_snap_mapper_regs_, snap_board_regs_, "snap mapper regs upload");
+            copy_to_device(device_snap_irq_line_, snap_irq_line_, "snap irq line upload");
+            snapshot_template_.mapper_regs = device_snap_mapper_regs_;
+            snapshot_template_.irq_line = device_snap_irq_line_;
+        }
 
         snapshot_template_.cpu_ram = device_snapshot_cpu_ram_;
         snapshot_template_.prg_ram = device_snapshot_prg_ram_;
@@ -1627,26 +1718,11 @@ private:
     // Seed the presentation snapshot from live state so render() is coherent
     // even before the first stepped vblank refreshes it (e.g. render right
     // after reset). All copies are device-to-device.
+    // Every env presents its current state as a frame with no writes (frame log banks,
+    // frozen nametable RAM and OAM), and has no sprite-0 event pending.
     void seed_presentation_snapshot() {
-        auto d2d = [&](void* dst, const void* src, std::size_t bytes, const char* label) {
-            check_cuda(cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToDevice), label);
-        };
-        d2d(device_snap_nametable_, device_nametable_,
-            static_cast<std::size_t>(num_env_) * nesle::cuda::kNametableRamBytes, "seed snap nametable");
-        d2d(device_snap_palette_, device_palette_,
-            static_cast<std::size_t>(num_env_) * nesle::cuda::kPaletteRamBytes, "seed snap palette");
-        d2d(device_snap_oam_, device_oam_,
-            static_cast<std::size_t>(num_env_) * nesle::cuda::kOamBytes, "seed snap oam");
-        d2d(device_snap_mask_, device_ppu_mask_, num_env_, "seed snap mask");
-        for (auto* dst : {device_lat_scroll_x_, device_snap_scroll_x_start_, device_snap_scroll_x_end_}) {
-            d2d(dst, device_ppu_scroll_x_, num_env_, "seed snap scroll x");
-        }
-        for (auto* dst : {device_lat_scroll_y_, device_snap_scroll_y_start_, device_snap_scroll_y_end_}) {
-            d2d(dst, device_ppu_scroll_y_, num_env_, "seed snap scroll y");
-        }
-        for (auto* dst : {device_lat_ctrl_, device_snap_ctrl_start_, device_snap_ctrl_end_}) {
-            d2d(dst, device_ppu_ctrl_, num_env_, "seed snap ctrl");
-        }
+        nesle::cuda::launch_seed_frame_log_kernel(buffers_, num_env_, nullptr);
+        check_cuda(cudaGetLastError(), "launch_seed_frame_log_kernel");
     }
 
     std::uint32_t num_env_ = 0;
@@ -1672,6 +1748,8 @@ private:
     std::uint32_t* device_pending_dma_cycles_ = nullptr;
     std::uint32_t* device_fault_ = nullptr;
     std::uint32_t* device_fault_pending_ = nullptr;
+    std::uint64_t* device_dmc_event_ = nullptr;
+    nesle::cuda::DmcState* device_dmc_ = nullptr;
     int* device_previous_x_ = nullptr;
     int* device_previous_time_ = nullptr;
     float* device_rewards_ = nullptr;
@@ -1702,20 +1780,17 @@ private:
     std::uint8_t* device_chr_rom_ = nullptr;
     std::uint8_t* device_chr_ram_ = nullptr;
     std::uint8_t* device_prg_bank_ = nullptr;
+    std::uint32_t* device_prg_page_ = nullptr;
+    std::uint32_t* device_chr_page_ = nullptr;
+    std::uint8_t* device_mirroring_ = nullptr;
+    std::uint8_t* device_mapper_regs_ = nullptr;
+    std::uint32_t* device_sprite0_dot_ = nullptr;
     std::uint8_t* device_frames_ = nullptr;
-    std::uint8_t* device_lat_scroll_x_ = nullptr;
-    std::uint8_t* device_lat_scroll_y_ = nullptr;
-    std::uint8_t* device_lat_ctrl_ = nullptr;
-    std::uint8_t* device_snap_scroll_x_start_ = nullptr;
-    std::uint8_t* device_snap_scroll_y_start_ = nullptr;
-    std::uint8_t* device_snap_ctrl_start_ = nullptr;
-    std::uint8_t* device_snap_scroll_x_end_ = nullptr;
-    std::uint8_t* device_snap_scroll_y_end_ = nullptr;
-    std::uint8_t* device_snap_ctrl_end_ = nullptr;
-    std::uint8_t* device_snap_mask_ = nullptr;
+    std::uint32_t* device_frame_log_ = nullptr;
+    std::uint16_t* device_log_count_ = nullptr;
+    std::uint8_t* device_log_bank_ = nullptr;
     std::uint8_t* device_snap_oam_ = nullptr;
     std::uint8_t* device_snap_nametable_ = nullptr;
-    std::uint8_t* device_snap_palette_ = nullptr;
     std::uint8_t* device_reset_mask_ = nullptr;
     std::uint64_t* device_stat_instructions_ = nullptr;
     std::uint32_t* device_stat_frames_completed_ = nullptr;
@@ -1733,6 +1808,10 @@ private:
     std::uint8_t* device_snapshot_oam_ = nullptr;
     std::uint8_t* device_snapshot_chr_ram_ = nullptr;
     std::uint8_t* device_snap_cart_latch_ = nullptr;
+    std::vector<std::uint8_t> snap_board_regs_;  // paged boards: kMapperRegBytes per level
+    std::vector<std::uint8_t> snap_irq_line_;
+    std::uint8_t* device_snap_mapper_regs_ = nullptr;
+    std::uint8_t* device_snap_irq_line_ = nullptr;
     std::uint16_t* device_snap_pc_ = nullptr;
     std::uint8_t* device_snap_a_ = nullptr;
     std::uint8_t* device_snap_x_ = nullptr;

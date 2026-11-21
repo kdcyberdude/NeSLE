@@ -1,434 +1,90 @@
 #pragma once
 
+// The picture render() returns: the frame log frozen at the last vblank, replayed
+// through FCEUmm's line renderer (batch_frame.cuh), in the RGB stable_retro returns.
+
 #include <cstdint>
 
-#include "nesle/cuda/mapper.cuh"
+#include "nesle/cuda/batch_frame.cuh"
 #include "nesle/cuda/state.cuh"
 
 #ifdef __CUDACC__
-// Forced inlining matters here: the per-pixel render path is a deep chain of
-// small helpers whose performance depends on full inlining. When the module
-// grew (table-driven CPU decode), nvcc's inlining heuristics backed off and
-// both render kernels slowed ~2.3x; forcing inlining restores them.
-// __forceinline__ already implies `inline`, so it REPLACES the keyword — the
-// GNU-toolchain nvcc rejects the duplicate specifier that writing both causes.
 #define NESLE_CUDA_RENDER_HD __host__ __device__
-#define NESLE_CUDA_RENDER_INLINE __forceinline__
 #else
 #define NESLE_CUDA_RENDER_HD
-#define NESLE_CUDA_RENDER_INLINE inline
 #endif
 
 namespace nesle::cuda {
 
-constexpr std::uint8_t kNesPaletteRgbHost[64 * 3] = {
-    0x54, 0x54, 0x54, 0x00, 0x1e, 0x74, 0x08, 0x10, 0x90, 0x30, 0x00, 0x88,
-    0x44, 0x00, 0x64, 0x5c, 0x00, 0x30, 0x54, 0x04, 0x00, 0x3c, 0x18, 0x00,
-    0x20, 0x2a, 0x00, 0x08, 0x3a, 0x00, 0x00, 0x40, 0x00, 0x00, 0x3c, 0x00,
-    0x00, 0x32, 0x3c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x98, 0x96, 0x98, 0x08, 0x4c, 0xc4, 0x30, 0x32, 0xec, 0x5c, 0x1e, 0xe4,
-    0x88, 0x14, 0xb0, 0xa0, 0x14, 0x64, 0x98, 0x22, 0x20, 0x78, 0x3c, 0x00,
-    0x54, 0x5a, 0x00, 0x28, 0x72, 0x00, 0x08, 0x7c, 0x00, 0x00, 0x76, 0x28,
-    0x00, 0x66, 0x78, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0xec, 0xee, 0xec, 0x4c, 0x9a, 0xec, 0x78, 0x7c, 0xec, 0xb0, 0x62, 0xec,
-    0xe4, 0x54, 0xec, 0xec, 0x58, 0xb4, 0xec, 0x6a, 0x64, 0xd4, 0x88, 0x20,
-    0xa0, 0xaa, 0x00, 0x74, 0xc4, 0x00, 0x4c, 0xd0, 0x20, 0x38, 0xcc, 0x6c,
-    0x38, 0xb4, 0xcc, 0x3c, 0x3c, 0x3c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0xec, 0xee, 0xec, 0xa8, 0xcc, 0xec, 0xbc, 0xbc, 0xec, 0xd4, 0xb2, 0xec,
-    0xec, 0xae, 0xec, 0xec, 0xae, 0xd4, 0xec, 0xb4, 0xb0, 0xe4, 0xc4, 0x90,
-    0xcc, 0xd2, 0x78, 0xb4, 0xde, 0x78, 0xa8, 0xe2, 0x90, 0x98, 0xe2, 0xb4,
-    0xa0, 0xd6, 0xe4, 0xa0, 0xa2, 0xa0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-};
-
-#ifdef __CUDACC__
-static __device__ __constant__ const std::uint8_t kNesPaletteRgbDevice[64 * 3] = {
-    0x54, 0x54, 0x54, 0x00, 0x1e, 0x74, 0x08, 0x10, 0x90, 0x30, 0x00, 0x88,
-    0x44, 0x00, 0x64, 0x5c, 0x00, 0x30, 0x54, 0x04, 0x00, 0x3c, 0x18, 0x00,
-    0x20, 0x2a, 0x00, 0x08, 0x3a, 0x00, 0x00, 0x40, 0x00, 0x00, 0x3c, 0x00,
-    0x00, 0x32, 0x3c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x98, 0x96, 0x98, 0x08, 0x4c, 0xc4, 0x30, 0x32, 0xec, 0x5c, 0x1e, 0xe4,
-    0x88, 0x14, 0xb0, 0xa0, 0x14, 0x64, 0x98, 0x22, 0x20, 0x78, 0x3c, 0x00,
-    0x54, 0x5a, 0x00, 0x28, 0x72, 0x00, 0x08, 0x7c, 0x00, 0x00, 0x76, 0x28,
-    0x00, 0x66, 0x78, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0xec, 0xee, 0xec, 0x4c, 0x9a, 0xec, 0x78, 0x7c, 0xec, 0xb0, 0x62, 0xec,
-    0xe4, 0x54, 0xec, 0xec, 0x58, 0xb4, 0xec, 0x6a, 0x64, 0xd4, 0x88, 0x20,
-    0xa0, 0xaa, 0x00, 0x74, 0xc4, 0x00, 0x4c, 0xd0, 0x20, 0x38, 0xcc, 0x6c,
-    0x38, 0xb4, 0xcc, 0x3c, 0x3c, 0x3c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0xec, 0xee, 0xec, 0xa8, 0xcc, 0xec, 0xbc, 0xbc, 0xec, 0xd4, 0xb2, 0xec,
-    0xec, 0xae, 0xec, 0xec, 0xae, 0xd4, 0xec, 0xb4, 0xb0, 0xe4, 0xc4, 0x90,
-    0xcc, 0xd2, 0x78, 0xb4, 0xde, 0x78, 0xa8, 0xe2, 0x90, 0x98, 0xe2, 0xb4,
-    0xa0, 0xd6, 0xe4, 0xa0, 0xa2, 0xa0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-};
-#endif
-
-NESLE_CUDA_RENDER_HD NESLE_CUDA_RENDER_INLINE std::uint8_t* env_frame_rgb(BatchBuffers& buffers,
-                                                        std::uint32_t env) {
-    return buffers.frames_rgb +
-           static_cast<std::uint64_t>(env) * kFrameWidth * kFrameHeight * kRgbChannels;
+NESLE_CUDA_RENDER_HD inline std::uint8_t* env_frame_rgb(BatchBuffers& buffers, std::uint32_t env) {
+    return buffers.frames_rgb + static_cast<std::uint64_t>(env) * kFrameWidth * kFrameHeight * kRgbChannels;
 }
 
-NESLE_CUDA_RENDER_HD NESLE_CUDA_RENDER_INLINE const std::uint8_t* env_nametable_ram(
-    const BatchBuffers& buffers,
-    std::uint32_t env) {
-    return buffers.ppu.nametable_ram +
-           static_cast<std::uint64_t>(env) * kNametableRamBytes;
+// Where an env's picture comes from: the bank frozen at the last vblank with the
+// nametable RAM and OAM frozen with it, or, without a frame log (host tests, older
+// callers), the live state as a frame with no writes (its header built in `scratch`).
+NESLE_CUDA_RENDER_HD inline ReplaySource render_source(const BatchBuffers& b,
+                                                       std::uint32_t env,
+                                                       std::uint32_t* scratch) {
+    const std::uint8_t* nametable = b.ppu.nametable_ram + static_cast<std::uint64_t>(env) * kNametableRamBytes;
+    const std::uint8_t* oam = b.ppu.oam + static_cast<std::uint64_t>(env) * kOamBytes;
+    if (b.ppu.frame_log == nullptr) {
+        frame_log_fill_header(b, env, b.ppu.ctrl[env], b.ppu.mask[env], scratch);
+        return replay_source(b, env, scratch, 0, nametable, oam);
+    }
+    if (b.ppu.snap_nametable != nullptr) {
+        nametable = b.ppu.snap_nametable + static_cast<std::uint64_t>(env) * kNametableRamBytes;
+    }
+    if (b.ppu.snap_oam != nullptr) {
+        oam = b.ppu.snap_oam + static_cast<std::uint64_t>(env) * kOamBytes;
+    }
+    const std::uint32_t* h = frame_log_bank(b, env, b.ppu.log_bank[env] & 1u);
+    return replay_source(b, env, h, h[0] & ~kLogOverflow, nametable, oam);
 }
 
-NESLE_CUDA_RENDER_HD NESLE_CUDA_RENDER_INLINE const std::uint8_t* env_palette_ram(
-    const BatchBuffers& buffers,
-    std::uint32_t env) {
-    return buffers.ppu.palette_ram + static_cast<std::uint64_t>(env) * kPaletteRamBytes;
-}
-
-NESLE_CUDA_RENDER_HD NESLE_CUDA_RENDER_INLINE std::uint16_t mirror_batch_palette_address(
-    std::uint16_t address) {
-    auto index = static_cast<std::uint16_t>(address & 0x001F);
-    if (index == 0x10 || index == 0x14 || index == 0x18 || index == 0x1C) {
-        index = static_cast<std::uint16_t>(index - 0x10);
-    }
-    return index;
-}
-
-NESLE_CUDA_RENDER_HD NESLE_CUDA_RENDER_INLINE std::uint16_t mirror_batch_nametable_address(
-    const CartridgeView& cart,
-    std::uint16_t address) {
-    return mirror_nametable_address(cart.nametable_arrangement, address);
-}
-
-NESLE_CUDA_RENDER_HD NESLE_CUDA_RENDER_INLINE std::uint8_t batch_ppu_memory_read(const BatchBuffers& buffers,
-                                                               std::uint32_t env,
-                                                               std::uint16_t address) {
-    address = static_cast<std::uint16_t>(address & 0x3FFF);
-    if (address < 0x2000) {
-        return read_chr(buffers, env, address);
-    }
-    if (address < 0x3F00) {
-        if (address >= 0x3000) {
-            address = static_cast<std::uint16_t>(address - 0x1000);
-        }
-        return env_nametable_ram(buffers, env)[mirror_nametable_address(
-            env_nametable_arrangement(buffers, env), address)];
-    }
-    return env_palette_ram(buffers, env)[mirror_batch_palette_address(address)];
-}
-
-NESLE_CUDA_RENDER_HD NESLE_CUDA_RENDER_INLINE std::uint8_t batch_palette_entry(const BatchBuffers& buffers,
-                                                             std::uint32_t env,
-                                                             std::uint16_t index) {
-    auto value = batch_ppu_memory_read(buffers, env, static_cast<std::uint16_t>(0x3F00 + index));
-    if ((buffers.ppu.mask[env] & 0x01) != 0) {
-        value = static_cast<std::uint8_t>(value & 0x30);
-    }
-    return static_cast<std::uint8_t>(value & 0x3F);
-}
-
-NESLE_CUDA_RENDER_HD NESLE_CUDA_RENDER_INLINE void write_batch_rgb(std::uint8_t* frame,
-                                                 std::uint32_t pixel,
-                                                 std::uint8_t palette_index) {
-    const auto rgb = static_cast<std::uint16_t>((palette_index & 0x3F) * 3);
-#ifdef __CUDA_ARCH__
-    frame[pixel * 3] = kNesPaletteRgbDevice[rgb];
-    frame[pixel * 3 + 1] = kNesPaletteRgbDevice[rgb + 1];
-    frame[pixel * 3 + 2] = kNesPaletteRgbDevice[rgb + 2];
-#else
-    frame[pixel * 3] = kNesPaletteRgbHost[rgb];
-    frame[pixel * 3 + 1] = kNesPaletteRgbHost[rgb + 1];
-    frame[pixel * 3 + 2] = kNesPaletteRgbHost[rgb + 2];
-#endif
-}
-
-NESLE_CUDA_RENDER_HD NESLE_CUDA_RENDER_INLINE std::uint8_t batch_pattern_pixel(const BatchBuffers& buffers,
-                                                             std::uint32_t env,
-                                                             std::uint16_t tile_base,
-                                                             std::uint8_t fine_x,
-                                                             std::uint8_t fine_y) {
-    const auto low =
-        batch_ppu_memory_read(buffers, env, static_cast<std::uint16_t>(tile_base + fine_y));
-    const auto high =
-        batch_ppu_memory_read(buffers, env, static_cast<std::uint16_t>(tile_base + fine_y + 8));
-    const auto bit = static_cast<std::uint8_t>(7 - fine_x);
-    return static_cast<std::uint8_t>(((low >> bit) & 0x01) | (((high >> bit) & 0x01) << 1));
-}
-
-NESLE_CUDA_RENDER_HD NESLE_CUDA_RENDER_INLINE std::uint8_t batch_background_color(const BatchBuffers& buffers,
-                                                                std::uint32_t env,
-                                                                std::uint16_t x,
-                                                                std::uint16_t y) {
-    if ((buffers.ppu.mask[env] & 0x08) == 0 || ((buffers.ppu.mask[env] & 0x02) == 0 && x < 8)) {
-        return 0;
-    }
-
-    const auto scroll_x = buffers.ppu.scroll_x != nullptr ? buffers.ppu.scroll_x[env] : 0;
-    const auto scroll_y = buffers.ppu.scroll_y != nullptr ? buffers.ppu.scroll_y[env] : 0;
-    const auto world_y = static_cast<unsigned>(scroll_y) + static_cast<unsigned>(y);
-    const auto coarse_y = static_cast<std::uint8_t>((world_y % 240) / 8);
-    const auto fine_y = static_cast<std::uint8_t>(world_y & 0x07);
-    const auto base_nametable = static_cast<std::uint8_t>(buffers.ppu.ctrl[env] & 0x03);
-    const auto nt_y = static_cast<std::uint8_t>(((base_nametable >> 1) + (world_y / 240)) & 0x01);
-    const auto world_x = static_cast<unsigned>(scroll_x) + static_cast<unsigned>(x);
-    const auto coarse_x = static_cast<std::uint8_t>((world_x & 0xFF) / 8);
-    const auto fine_x = static_cast<std::uint8_t>(world_x & 0x07);
-    const auto nt_x = static_cast<std::uint8_t>(((base_nametable & 0x01) + (world_x / 256)) & 0x01);
-    const auto nametable = static_cast<std::uint8_t>(nt_x | (nt_y << 1));
-    const auto nametable_base = static_cast<std::uint16_t>(0x2000 + nametable * 0x0400);
-    const auto pattern_base = (buffers.ppu.ctrl[env] & 0x10) != 0 ? 0x1000 : 0x0000;
-    const auto tile = batch_ppu_memory_read(
-        buffers,
-        env,
-        static_cast<std::uint16_t>(nametable_base + coarse_y * 32 + coarse_x));
-    const auto color = batch_pattern_pixel(
-        buffers,
-        env,
-        static_cast<std::uint16_t>(pattern_base + static_cast<std::uint16_t>(tile) * 16),
-        fine_x,
-        fine_y);
-    if (color == 0) {
-        return 0;
-    }
-
-    const auto attribute = batch_ppu_memory_read(
-        buffers,
-        env,
-        static_cast<std::uint16_t>(nametable_base + 0x03C0 + (coarse_y / 4) * 8 + (coarse_x / 4)));
-    const auto shift = static_cast<std::uint8_t>(((coarse_y & 0x02) << 1) | (coarse_x & 0x02));
-    const auto palette = static_cast<std::uint8_t>((attribute >> shift) & 0x03);
-    return batch_palette_entry(buffers, env, static_cast<std::uint16_t>(palette * 4 + color));
-}
-
-NESLE_CUDA_RENDER_HD NESLE_CUDA_RENDER_INLINE std::uint8_t batch_sprite_pattern_pixel(const BatchBuffers& buffers,
-                                                                    std::uint32_t env,
-                                                                    std::uint8_t tile,
-                                                                    std::uint8_t attributes,
-                                                                    std::uint8_t pixel_x,
-                                                                    std::uint8_t pixel_y) {
-    if ((attributes & 0x40) != 0) {
-        pixel_x = static_cast<std::uint8_t>(7 - pixel_x);
-    }
-
-    if ((buffers.ppu.ctrl[env] & 0x20) != 0) {
-        if ((attributes & 0x80) != 0) {
-            pixel_y = static_cast<std::uint8_t>(15 - pixel_y);
-        }
-        const auto pattern_base = static_cast<std::uint16_t>((tile & 0x01) ? 0x1000 : 0x0000);
-        const auto tile_number = static_cast<std::uint8_t>((tile & 0xFE) + (pixel_y / 8));
-        return batch_pattern_pixel(
-            buffers,
-            env,
-            static_cast<std::uint16_t>(pattern_base + tile_number * 16),
-            pixel_x,
-            static_cast<std::uint8_t>(pixel_y & 0x07));
-    }
-
-    if ((attributes & 0x80) != 0) {
-        pixel_y = static_cast<std::uint8_t>(7 - pixel_y);
-    }
-    const auto pattern_base = (buffers.ppu.ctrl[env] & 0x08) != 0 ? 0x1000 : 0x0000;
-    return batch_pattern_pixel(
-        buffers,
-        env,
-        static_cast<std::uint16_t>(pattern_base + static_cast<std::uint16_t>(tile) * 16),
-        pixel_x,
-        pixel_y);
-}
-
-// Core frame renderer. `target` supplies the output frame buffer; `hud` and
-// `play` supply PPU state for rows above and below `split_y` respectively
-// (SMB's status-bar scroll split). Callers without a presentation snapshot
-// pass the same buffers for all three with split_y = 0 — the original
-// live-state behavior.
-NESLE_CUDA_RENDER_HD NESLE_CUDA_RENDER_INLINE void render_batch_rgb_frame_env_impl(BatchBuffers& target,
-                                                                 BatchBuffers& hud,
-                                                                 BatchBuffers& play,
-                                                                 std::uint32_t env,
-                                                                 int split_y) {
-    auto* frame = env_frame_rgb(target, env);
-    const auto backdrop = batch_palette_entry(play, env, 0);
-    for (std::uint32_t pixel = 0; pixel < kFrameWidth * kFrameHeight; ++pixel) {
-        write_batch_rgb(frame, pixel, backdrop);
-    }
-
-    for (std::uint16_t y = 0; y < kFrameHeight; ++y) {
-        auto& src = (static_cast<int>(y) < split_y) ? hud : play;
-        for (std::uint16_t x = 0; x < kFrameWidth; ++x) {
-            const auto color = batch_background_color(src, env, x, y);
-            if (color != 0) {
-                write_batch_rgb(frame, y * kFrameWidth + x, color);
-            }
-        }
-    }
-
-    BatchBuffers& buffers = play;
-    if ((buffers.ppu.mask[env] & 0x10) == 0 || buffers.ppu.oam == nullptr) {
-        return;
-    }
-
-    const bool show_left = (buffers.ppu.mask[env] & 0x04) != 0;
-    const auto sprite_height = static_cast<std::uint8_t>((buffers.ppu.ctrl[env] & 0x20) != 0 ? 16 : 8);
-    const auto* oam = env_oam(buffers, env);
-    for (int sprite = 63; sprite >= 0; --sprite) {
-        const auto base = static_cast<std::uint16_t>(sprite * 4);
-        const auto top = static_cast<int>(oam[base]) + 1;
-        const auto tile = oam[base + 1];
-        const auto attributes = oam[base + 2];
-        const auto left = static_cast<int>(oam[base + 3]);
-        const auto palette = static_cast<std::uint8_t>(attributes & 0x03);
-        const bool behind_background = (attributes & 0x20) != 0;
-
-        for (int sy = 0; sy < sprite_height; ++sy) {
-            const auto y = top + sy;
-            if (y < 0 || y >= kFrameHeight) {
-                continue;
-            }
-
-            for (int sx = 0; sx < 8; ++sx) {
-                const auto x = left + sx;
-                if (x < 0 || x >= kFrameWidth || (!show_left && x < 8)) {
-                    continue;
-                }
-
-                if (behind_background &&
-                    batch_background_color(
-                        buffers,
-                        env,
-                        static_cast<std::uint16_t>(x),
-                        static_cast<std::uint16_t>(y)) != 0) {
-                    continue;
-                }
-
-                const auto color = batch_sprite_pattern_pixel(
-                    buffers,
-                    env,
-                    tile,
-                    attributes,
-                    static_cast<std::uint8_t>(sx),
-                    static_cast<std::uint8_t>(sy));
-                if (color == 0) {
-                    continue;
-                }
-                const auto palette_value =
-                    batch_palette_entry(buffers, env, static_cast<std::uint16_t>(0x10 + palette * 4 + color));
-                write_batch_rgb(frame, static_cast<std::uint32_t>(y * kFrameWidth + x), palette_value);
-            }
-        }
+// Line `l` from FCEUmm's state at its start: background, sprites, greyscale, then
+// the RGB of each pixel for the line's emphasis.
+NESLE_CUDA_RENDER_HD inline void render_line_rgb(const ReplaySource& src,
+                                                 ReplayState& s,
+                                                 ReplayLine& line,
+                                                 int l,
+                                                 std::uint8_t* out) {
+    replay_line(src, s, line, l, true);
+    const std::uint32_t emphasis = replay_compose(s, line);
+    const std::uint32_t tint = src.header[15] & 7u;
+    for (int x = 0; x < 256; ++x) {
+        fceumm_rgb(line.px[x], emphasis, tint, out + 3 * x);
     }
 }
 
-// Presentation-snapshot resolution shared by the serial frame renderer and
-// the block-per-env device kernel: the shadow BatchBuffers views for rows
-// above `split_y` (`hud`) and at/below it (`play`), plus `split_y` itself.
-struct RenderEnvViews {
-    BatchBuffers hud;
-    BatchBuffers play;
-    int split_y;
-};
-
-NESLE_CUDA_RENDER_HD NESLE_CUDA_RENDER_INLINE RenderEnvViews resolve_render_env_views(BatchBuffers& buffers,
-                                                                    std::uint32_t env) {
-    if (buffers.ppu.snap_nametable == nullptr) {
-        // No presentation snapshot (host tests, legacy callers): render from
-        // live state as before.
-        return RenderEnvViews{buffers, buffers, 0};
+// Serial: one env's whole frame.
+NESLE_CUDA_RENDER_HD inline void render_batch_rgb_frame_env(BatchBuffers& buffers, std::uint32_t env) {
+    std::uint32_t scratch[kLogHeaderWords];
+    const ReplaySource src = render_source(buffers, env, scratch);
+    ReplayState s;
+    replay_load_header(s, src.header);
+    ReplayLine line;
+    replay_begin_frame(src, s);
+    std::uint8_t* frame = env_frame_rgb(buffers, env);
+    for (int l = 0; l < kFrameHeight; ++l) {
+        render_line_rgb(src, s, line, l, frame + static_cast<std::uint32_t>(l) * kFrameWidth * kRgbChannels);
+        replay_end_of_line(src, s, l, true);
     }
-
-    // Render from the vblank-frozen presentation snapshot so the frame is
-    // internally consistent regardless of where stepping paused. Playfield
-    // rows use end-of-frame scroll/ctrl; rows above sprite-0's bottom edge use
-    // frame-start values (SMB pins its status bar with the sprite-0 split).
-    BatchBuffers play = buffers;
-    play.ppu.nametable_ram = buffers.ppu.snap_nametable;
-    play.ppu.palette_ram = buffers.ppu.snap_palette;
-    play.ppu.oam = buffers.ppu.snap_oam;
-    play.ppu.scroll_x = buffers.ppu.snap_scroll_x_end;
-    play.ppu.scroll_y = buffers.ppu.snap_scroll_y_end;
-    play.ppu.ctrl = buffers.ppu.snap_ctrl_end;
-    play.ppu.mask = buffers.ppu.snap_mask;
-
-    BatchBuffers hud = play;
-    hud.ppu.scroll_x = buffers.ppu.snap_scroll_x_start;
-    hud.ppu.scroll_y = buffers.ppu.snap_scroll_y_start;
-    hud.ppu.ctrl = buffers.ppu.snap_ctrl_start;
-
-    const auto* snap_oam = buffers.ppu.snap_oam + static_cast<std::uint64_t>(env) * kOamBytes;
-    const auto sprite_height = (play.ppu.ctrl[env] & 0x20) != 0 ? 16 : 8;
-    int split_y = static_cast<int>(snap_oam[0]) + 1 + sprite_height;
-    if (split_y >= kFrameHeight) {
-        // Sprite 0 offscreen this frame: no reliable split point. Render the
-        // whole frame with frame-start values — the HUD stays intact and the
-        // playfield is at most one frame of scroll stale, which is far less
-        // visible than a vanishing status bar.
-        return RenderEnvViews{hud, hud, 0};
-    }
-    return RenderEnvViews{hud, play, split_y};
 }
 
-// Renders one pixel of the composited frame. A pure function of PPU state —
-// it never reads the frame buffer — so callers may evaluate pixels in any
-// order or in parallel. Matches render_batch_rgb_frame_env_impl exactly: per
-// pixel, the winner of that loop's last-drawn-wins (63 -> 0) sprite order is
-// the lowest-index sprite that is opaque and not occluded, so a 0 -> 63 scan
-// taking the first hit is equivalent.
-NESLE_CUDA_RENDER_HD NESLE_CUDA_RENDER_INLINE void render_batch_rgb_pixel_env(BatchBuffers& target,
-                                                            BatchBuffers& hud,
-                                                            BatchBuffers& play,
-                                                            std::uint32_t env,
-                                                            int split_y,
-                                                            std::uint32_t pixel) {
-    const auto x = static_cast<std::uint16_t>(pixel % kFrameWidth);
-    const auto y = static_cast<std::uint16_t>(pixel / kFrameWidth);
-
-    auto& bg_src = (static_cast<int>(y) < split_y) ? hud : play;
-    auto color = batch_background_color(bg_src, env, x, y);
-    if (color == 0) {
-        color = batch_palette_entry(play, env, 0);
+// For drawing lines in parallel: FCEUmm's state at the start of every line. Lines are
+// only drawn here where sprite 0 is checked (the check changes what comes after).
+NESLE_CUDA_RENDER_HD inline void render_line_states(const ReplaySource& src, ReplayState* states) {
+    ReplayState s;
+    replay_load_header(s, src.header);
+    ReplayLine line;
+    replay_begin_frame(src, s);
+    for (int l = 0; l < kFrameHeight; ++l) {
+        states[l] = s;
+        replay_line(src, s, line, l, s.sphitx != 0x100);
+        s.spork = (s.mask & 0x10u) != 0 ? 0 : s.spork;  // CopySprites
+        replay_end_of_line(src, s, l, true);
     }
-
-    BatchBuffers& buffers = play;
-    const bool show_left = (buffers.ppu.mask[env] & 0x04) != 0;
-    if ((buffers.ppu.mask[env] & 0x10) != 0 && buffers.ppu.oam != nullptr &&
-        (show_left || x >= 8)) {
-        const auto sprite_height =
-            static_cast<std::uint8_t>((buffers.ppu.ctrl[env] & 0x20) != 0 ? 16 : 8);
-        const auto* oam = env_oam(buffers, env);
-        for (int sprite = 0; sprite < 64; ++sprite) {
-            const auto base = static_cast<std::uint16_t>(sprite * 4);
-            const auto sy = static_cast<int>(y) - (static_cast<int>(oam[base]) + 1);
-            if (sy < 0 || sy >= sprite_height) {
-                continue;
-            }
-            const auto sx = static_cast<int>(x) - static_cast<int>(oam[base + 3]);
-            if (sx < 0 || sx >= 8) {
-                continue;
-            }
-            const auto attributes = oam[base + 2];
-            if ((attributes & 0x20) != 0 && batch_background_color(buffers, env, x, y) != 0) {
-                continue;
-            }
-            const auto sprite_color = batch_sprite_pattern_pixel(
-                buffers,
-                env,
-                oam[base + 1],
-                attributes,
-                static_cast<std::uint8_t>(sx),
-                static_cast<std::uint8_t>(sy));
-            if (sprite_color == 0) {
-                continue;
-            }
-            const auto palette = static_cast<std::uint8_t>(attributes & 0x03);
-            color = batch_palette_entry(
-                buffers,
-                env,
-                static_cast<std::uint16_t>(0x10 + palette * 4 + sprite_color));
-            break;
-        }
-    }
-
-    write_batch_rgb(env_frame_rgb(target, env), pixel, color);
-}
-
-NESLE_CUDA_RENDER_HD NESLE_CUDA_RENDER_INLINE void render_batch_rgb_frame_env(BatchBuffers& buffers,
-                                                            std::uint32_t env) {
-    auto views = resolve_render_env_views(buffers, env);
-    render_batch_rgb_frame_env_impl(buffers, views.hud, views.play, env, views.split_y);
 }
 
 }  // namespace nesle::cuda

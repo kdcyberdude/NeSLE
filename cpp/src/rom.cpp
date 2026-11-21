@@ -75,6 +75,14 @@ std::string to_string(std::uint16_t mapper) {
             return "BNROM";
         case 94:
             return "UN1ROM";
+        case 1:
+            return "MMC1";
+        case 3:
+            return "CNROM";
+        case 4:
+            return "MMC3";
+        case 9:
+            return "MMC2";
         default:
             return "mapper " + std::to_string(mapper);
     }
@@ -127,6 +135,16 @@ MapperLayout describe_mapper(const RomMetadata& metadata) noexcept {
             break;
 
         case 34:
+            if (metadata.chr_rom_size != 0) {  // NINA-001 (FCEUmm 34.c): paged, registers at $7FFD-$7FFF
+                layout.bank_kind = kBankKindNina001;
+                layout.prg_page_mask = static_cast<std::uint16_t>(metadata.prg_rom_size / 0x2000 - 1);
+                layout.chr_page_mask = static_cast<std::uint16_t>(metadata.chr_rom_size / 0x400 - 1);
+                layout.supported = metadata.prg_rom_size >= 0x8000 && metadata.prg_rom_size <= 512u * 1024u &&
+                                   page_count_is_power_of_two(metadata.prg_rom_size, 0x2000) &&
+                                   metadata.chr_rom_size <= 256u * 1024u &&
+                                   page_count_is_power_of_two(metadata.chr_rom_size, 0x2000);
+                break;
+            }
             // BNROM: one 32 KB window over the whole CPU space, CHR RAM.
             // NINA-001 is the other board behind mapper 34; it needs its own
             // window layout and is deliberately not supported here.
@@ -140,8 +158,146 @@ MapperLayout describe_mapper(const RomMetadata& metadata) noexcept {
                                page_count_is_power_of_two(metadata.prg_rom_size, 0x8000);
             break;
 
+        case 5: {  // MMC5. WRAM size from FCEUmm's MMC5CartList (unknown carts: 64 KB)
+            struct Size { std::uint32_t crc; std::uint32_t kb; };
+            static constexpr Size kList[] = {
+                {0x6f4e4312u, 32}, {0x15fe6d0fu, 16}, {0x671f23a8u, 0}, {0xcd4e7430u, 0}, {0xed2465beu, 0},
+                {0xfe3488d1u, 16}, {0x0ec6c023u, 8}, {0x0afb395eu, 0}, {0x1ced086fu, 16}, {0x9cbadc25u, 8},
+                {0x6396b988u, 16}, {0x9c18762bu, 16}, {0xb0480ae9u, 0}, {0xb4735facu, 0}, {0xf540677bu, 32},
+                {0xeee9a682u, 16}, {0xf9b4240fu, 16}, {0x8ce478dbu, 16}, {0xf011e490u, 32}, {0xbc80fb52u, 8},
+                {0x184c2124u, 32}, {0xee8e6553u, 32}, {0xd532e98fu, 8}, {0x39f2ce4bu, 16}, {0xbb7f829au, 0},
+                {0xaca15643u, 16}};
+            std::uint32_t kb = 64;
+            for (const auto& e : kList) {
+                if (e.crc == metadata.crc32) kb = e.kb;
+            }
+            const std::size_t chr_bytes =
+                metadata.chr_rom_size == 0 ? std::size_t{8 * 1024} : metadata.chr_rom_size;
+            layout.bank_kind = kBankKindMmc5;
+            layout.prg_page_mask = static_cast<std::uint16_t>(metadata.prg_rom_size / 0x2000 - 1);
+            layout.chr_page_mask = static_cast<std::uint16_t>(chr_bytes / 0x400 - 1);
+            layout.ext_ram_bytes = 0x1000u + kb * 1024u;
+            layout.supported = metadata.prg_rom_size >= 0x8000 && metadata.prg_rom_size <= 1024u * 1024u &&
+                               page_count_is_power_of_two(metadata.prg_rom_size, 0x2000) &&
+                               chr_bytes <= 1024u * 1024u && page_count_is_power_of_two(chr_bytes, 0x2000);
+            break;
+        }
+        case 1:   // MMC1 (SxROM)
+        case 105: // NWC 1990: MMC1 with a timer IRQ
+        case 3:   // CNROM
+        case 4:   // MMC3 (TxROM)
+        case 118: // MMC3, nametables from CHR bit 7 (TxSROM)
+        case 189: // MMC3, 32 KB PRG from $4120-$7FFF
+        case 245: // Waixing MMC3 with CHR RAM
+        case 64:  // Tengen RAMBO-1
+        case 158: // RAMBO-1 with CHR bit 7 picking each nametable (old FCEUmm M158PPU)
+        case 121: // MMC3 with a $5000 protection latch and PRG override (old FCEUmm 121.c)
+        case 187: // MMC3 with a $5000/$6000 PRG override and CHR A18 on the 2 KB half
+        case 119: // TQROM: MMC3 with CHR ROM and 8 KB CHR RAM side by side
+        case 74:  // MMC3 with 2 KB CHR RAM at banks 8-9 (ext_ram)
+        case 47:  // NES-QJ: MMC3 with a 128 KB block register at $6000
+        case 114: // MMC3 with scrambled registers and a 16 KB PRG override at $5000-$7FFF
+        case 182: // FCEUmm's database runs both 182 ROMs here as 114 (182 itself is deprecated there)
+        case 9:   // MMC2 (PxROM)
+        case 10: { // MMC4 (FxROM): MMC2's latches, 16 KB PRG
+            // Paged boards: no window; the bus goes through per-env page tables.
+            layout.bank_kind = metadata.mapper == 1 || metadata.mapper == 105 ? kBankKindMmc1
+                               : metadata.mapper == 3 ? kBankKindCnrom
+                               : metadata.mapper == 9 || metadata.mapper == 10 ? kBankKindMmc2
+                                                      : kBankKindMmc3;
+            // CNROM_Init (old FCEUmm): bus conflicts on, except five unlicensed carts listed by CRC.
+            layout.bus_conflicts = metadata.mapper == 3 && metadata.crc32 != 0xf283cf58u &&
+                                   metadata.crc32 != 0x2915faf0u && metadata.crc32 != 0xebd0644du &&
+                                   metadata.crc32 != 0x8f154a0du && metadata.crc32 != 0xd04a40e6u;
+            const std::size_t chr_bytes =
+                metadata.chr_rom_size == 0 ? std::size_t{8 * 1024} : metadata.chr_rom_size;
+            const bool prg_ok = metadata.prg_rom_size >= 0x4000u &&
+                                metadata.prg_rom_size <= (metadata.mapper == 245 ? 1024u : 512u) * 1024u &&
+                                page_count_is_power_of_two(metadata.prg_rom_size, 0x2000);
+            const bool chr_ok = chr_bytes <= (metadata.mapper == 187 || metadata.mapper == 121 || metadata.mapper == 10 ? 512u : 256u) * 1024u &&
+                                page_count_is_power_of_two(chr_bytes, 0x2000);
+            // CNROM and MMC2 have no CHR RAM variant that FCEUmm drives this way.
+            const bool chr_kind_ok =
+                metadata.chr_rom_size != 0 || layout.bank_kind == kBankKindMmc1 || layout.bank_kind == kBankKindMmc3;
+            layout.prg_page_mask = static_cast<std::uint16_t>(metadata.prg_rom_size / 0x2000 - 1);
+            layout.chr_page_mask = static_cast<std::uint16_t>(chr_bytes / 0x400 - 1);
+            layout.supported = prg_ok && chr_ok && chr_kind_ok;
+            if (metadata.mapper == 74) layout.ext_ram_bytes = 2048;
+            break;
+        }
+
+        case 15: case 32: case 88: case 91: case 42: case 68: case 19: case 17: case 6: case 16: case 222: case 117: case 18: case 48: case 13: case 8: case 227: case 73: case 188: case 243: case 133: case 149: case 246: case 75: case 90: case 209: case 83: case 228:
+        case 24: case 26: case 40: case 232:
+        case 21: case 22: case 23: case 25: case 69:
+        case 7: case 11: case 66: case 71: case 79: case 113: case 140: case 38: case 87: {
+            // Latch boards: paged like CNROM. CHR RAM only where the board has it (7, 71; FCEUmm allows it on all).
+            switch (metadata.mapper) {
+                case 7: layout.bank_kind = kBankKindAxrom; break;
+                case 11: layout.bank_kind = kBankKindColorDreams; break;
+                case 66: layout.bank_kind = kBankKindGxrom; break;
+                case 71: layout.bank_kind = kBankKindCamerica; break;
+                case 79: layout.bank_kind = kBankKindNina0306; break;
+                case 113: layout.bank_kind = kBankKindHes; break;
+                case 140: layout.bank_kind = kBankKindJaleco140; break;
+                case 21: layout.bank_kind = kBankKindVrc21; break;
+                case 22: layout.bank_kind = kBankKindVrc22; break;
+                case 23: layout.bank_kind = kBankKindVrc23; break;
+                case 25: layout.bank_kind = kBankKindVrc25; break;
+                case 69: layout.bank_kind = kBankKindFme7; break;
+                case 24: layout.bank_kind = kBankKindVrc6a; break;
+                case 26: layout.bank_kind = kBankKindVrc6b; break;
+                case 40: layout.bank_kind = kBankKindSmb2j40; break;
+                case 232: layout.bank_kind = kBankKindQuattro; break;
+                case 15: layout.bank_kind = kBankKindM15; break;
+                case 32: layout.bank_kind = kBankKindIrem32; break;
+                case 88: layout.bank_kind = kBankKindNamco88; break;
+                case 91: layout.bank_kind = kBankKindM91; break;
+                case 42: layout.bank_kind = kBankKindM42; break;
+                case 68: layout.bank_kind = kBankKindSunsoft4; break;
+                case 19: layout.bank_kind = kBankKindN163; break;
+                case 17: case 6: layout.bank_kind = kBankKindFfe; break;
+                case 16: layout.bank_kind = kBankKindBandai16; break;
+                case 222: layout.bank_kind = kBankKindM222; break;
+                case 117: layout.bank_kind = kBankKindM117; break;
+                case 18: layout.bank_kind = kBankKindJaleco18; break;
+                case 48: layout.bank_kind = kBankKindTaito48; break;
+                case 13: layout.bank_kind = kBankKindCprom; break;
+                case 8: layout.bank_kind = kBankKindM8; break;
+                case 227: layout.bank_kind = kBankKindM227; break;
+                case 73: layout.bank_kind = kBankKindVrc3; break;
+                case 188: layout.bank_kind = kBankKindM188; break;
+                case 243: layout.bank_kind = kBankKindM243; break;
+                case 133: case 149: layout.bank_kind = kBankKindSa72008; break;
+                case 246: layout.bank_kind = kBankKindM246; break;
+                case 75: layout.bank_kind = kBankKindVrc1; break;
+                case 90: case 209: layout.bank_kind = kBankKindJy90; break;
+                case 83: layout.bank_kind = kBankKindM83; break;
+                case 228: layout.bank_kind = kBankKindM228; break;
+                case 38: layout.bank_kind = kBankKindBitCorp38; break;
+                default: layout.bank_kind = kBankKindJaleco87; break;
+            }
+            const std::size_t chr_bytes =
+                metadata.chr_rom_size == 0 ? std::size_t{8 * 1024} : metadata.chr_rom_size;
+            layout.prg_page_mask = static_cast<std::uint16_t>(metadata.prg_rom_size / 0x2000 - 1);
+            layout.chr_page_mask = static_cast<std::uint16_t>(chr_bytes / 0x400 - 1);
+            layout.supported = metadata.prg_rom_size >= 0x4000 && metadata.prg_rom_size <= 512u * 1024u &&
+                               page_count_is_power_of_two(metadata.prg_rom_size, 0x2000) &&
+                               // A trainer (RomImage::trainer) is the host's to copy to $7000 at power, as
+                               // FCEUmm's iNES_ExecPower does on every board.
+                               chr_bytes <= 1024u * 1024u && page_count_is_power_of_two(chr_bytes, 0x2000);
+            break;
+        }
+
         default:
             break;
+    }
+    // FCEUmm SetupCartMirroring(4, 1, ExtraNTARAM): a four-screen header gets 2 KB more nametable RAM, here in
+    // ext_ram (with its vblank snapshot). Only these carts get it; every other cart keeps its allocation.
+    // FFE boards (6, 17) are left folded: the reference fceumm core draws Uchuusen - Cosmo Carrier (four-screen
+    // header, mapper 6) as if nametables 2-3 mirror 0-1; the source does not show why.
+    if (metadata.nametable_arrangement == NametableArrangement::FourScreen && layout.ext_ram_bytes == 0 &&
+        metadata.mapper != 5 && metadata.mapper != 74 && layout.bank_kind != kBankKindFfe) {
+        layout.ext_ram_bytes = 0x1000u;
     }
     return layout;
 }
@@ -159,7 +315,8 @@ std::string unsupported_mapper_reason(const RomMetadata& metadata) {
     }
     std::string reason = "unsupported mapper: " + to_string(metadata.mapper) + " (iNES " +
                          std::to_string(metadata.mapper) +
-                         "); NeSLE emulates NROM, UxROM, UN1ROM and BNROM (0, 2, 34, 94)";
+                         "); NeSLE emulates NROM, MMC1, UxROM, CNROM, MMC3, MMC2, BNROM and UN1ROM "
+                         "(0, 1, 2, 3, 4, 9, 34, 94)";
 
     if (metadata.prg_rom_size < 0x8000 || metadata.prg_rom_size % 0x2000 != 0) {
         reason += "; this image also has an unsupported PRG size (" +
@@ -227,8 +384,12 @@ RomImage parse_ines(std::span<const std::uint8_t> bytes) {
     const auto prg_banks = bytes[4];
     const auto chr_banks = bytes[5];
     const auto flags6 = bytes[6];
-    const auto flags7 = bytes[7];
-    const bool is_nes2 = (flags7 & 0x0C) == 0x08;
+    // Old dumping tools wrote text ("DiskDude!", "Ni03") into bytes 7-15. As FCEUX does, an iNES 1.0 header whose
+    // bytes 12-15 are not zero has a garbage flags 7, so its mapper high nibble is ignored.
+    const bool nes2_bits = (bytes[7] & 0x0C) == 0x08;
+    const bool dirty = !nes2_bits && (bytes[12] | bytes[13] | bytes[14] | bytes[15]) != 0;
+    const auto flags7 = dirty ? std::uint8_t{0} : bytes[7];
+    const bool is_nes2 = nes2_bits;
     if (is_nes2 && bytes[9] != 0) {
         throw std::invalid_argument("NES 2.0 extended PRG/CHR ROM sizes are not supported yet");
     }
@@ -270,17 +431,76 @@ RomImage parse_ines(std::span<const std::uint8_t> bytes) {
     }
 
     const std::size_t required = offset + metadata.prg_rom_size + metadata.chr_rom_size;
-    if (bytes.size() < required) {
+    // A file shorter than its header declares (a short last bank) loads as in FCEUX: the missing bytes read as 0.
+    if (bytes.size() < offset + 0x10) {
         throw std::invalid_argument("iNES data is truncated for declared PRG/CHR sizes");
+    }
+    std::vector<std::uint8_t> padded;
+    if (bytes.size() < required) {
+        padded.assign(bytes.begin(), bytes.end());
+        padded.resize(required, 0);
+        bytes = std::span<const std::uint8_t>(padded);
     }
 
     RomImage image;
     image.metadata = metadata;
+    if (metadata.has_trainer) {
+        image.trainer.assign(bytes.begin() + static_cast<std::ptrdiff_t>(kHeaderSize),
+                             bytes.begin() + static_cast<std::ptrdiff_t>(kHeaderSize + kTrainerSize));
+    }
     image.prg_rom.assign(bytes.begin() + static_cast<std::ptrdiff_t>(offset),
                          bytes.begin() + static_cast<std::ptrdiff_t>(offset + metadata.prg_rom_size));
     offset += metadata.prg_rom_size;
     image.chr_rom.assign(bytes.begin() + static_cast<std::ptrdiff_t>(offset),
                          bytes.begin() + static_cast<std::ptrdiff_t>(offset + metadata.chr_rom_size));
+    // FCEUmm's ines-correct.h overrides the header by the CRC32 of PRG + CHR. Only entries that no mapper-number rule
+    // covers are here.
+    {
+        std::uint32_t crc = 0xFFFFFFFFu;
+        for (const auto* rom : {&image.prg_rom, &image.chr_rom}) {
+            for (const std::uint8_t b : *rom) {
+                crc ^= b;
+                for (int k = 0; k < 8; ++k) crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+            }
+        }
+        crc = ~crc;
+        image.metadata.crc32 = crc;
+        // FCEUmm ines-correct.h entries with mirror 8: "anything but hard-wired four-screen"; a four-screen
+        // bit on these carts is cleared to horizontal (Mirroring = 0), so the board's own register rules.
+        static constexpr std::uint32_t kNotFourScreen[] = {
+            0xd8ee7669u, 0x5b837e8du, 0x37ba3261u, 0x5b6ca654u, 0x61a852eau, 0xf6fa4453u, 0x391aa1b8u, 0xa5e8d2cdu,
+            0x3f56a392u, 0x078ced30u, 0xfe364be5u, 0x57c12280u, 0xd09b74dcu, 0xe8baa782u, 0x970bd9c2u, 0xcd7a2fd7u,
+            0x63469396u, 0xe94d5181u, 0x7156cb4du, 0x70f67ab7u, 0x291bcd7du, 0xa9a4ea4cu, 0xcc3544b0u, 0x15141401u,
+            0x4cccd878u, 0x59280becu, 0x7474ac92u, 0x5337f73cu, 0x9eefb4b4u, 0x9cbadc25u, 0xf518dd58u, 0xbfc7a2e9u,
+            0x6e68e31au, 0x5555fca3u, 0x283ad224u, 0xaebd6549u, 0x6cdc0cd9u, 0x99c395f9u, 0xa7b0536cu, 0x40c0ad47u,
+            0x1500e835u, 0xb19a55ddu, 0x3d1c3137u, 0xbb7c5f7au, 0x10119e6bu, 0x0f141525u, 0xbda8f8e4u, 0xb1a94b82u,
+            0x026c5fcau, 0x3f15d20du, 0xd1691028u, 0xcfd4a281u, 0x2f27cdefu, 0xc1719664u, 0x983d8175u, 0x894efdbcu,
+            0x19e81461u, 0xbe06853fu, 0x0be0a328u, 0x5b457641u, 0xf51a7f46u, 0xcbf4366fu, 0x96ce586eu, 0x7678f1d5u,
+            0x62ef6c79u,
+        };
+        if (image.metadata.nametable_arrangement == NametableArrangement::FourScreen) {
+            for (const std::uint32_t c : kNotFourScreen) {
+                if (c == crc) image.metadata.nametable_arrangement = NametableArrangement::Horizontal;
+            }
+        }
+        if (crc == 0xBDE3AE9Bu) {  // Doraemon (World 3 hack): mapper 66, vertical (header says 120, four-screen)
+            image.metadata.mapper = 66;
+            image.metadata.nametable_arrangement = NametableArrangement::Vertical;
+        }
+    }
+    // Banked boards: as FCEUX does, an image whose PRG or CHR is not a power of two (PlayChoice dumps carry an 8 KB
+    // INST-ROM after the CHR, some hacks grew the CHR) is padded with $FF up to one, so bank masks wrap cleanly.
+    if (metadata.mapper != 0) {
+        auto pow2 = [](std::size_t n) { std::size_t p = 1; while (p < n) p <<= 1; return p; };
+        if (!image.prg_rom.empty() && pow2(image.prg_rom.size()) != image.prg_rom.size()) {
+            image.prg_rom.resize(pow2(image.prg_rom.size()), 0xFF);
+            image.metadata.prg_rom_size = image.prg_rom.size();
+        }
+        if (!image.chr_rom.empty() && pow2(image.chr_rom.size()) != image.chr_rom.size()) {
+            image.chr_rom.resize(pow2(image.chr_rom.size()), 0xFF);
+            image.metadata.chr_rom_size = image.chr_rom.size();
+        }
+    }
     return image;
 }
 

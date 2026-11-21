@@ -41,6 +41,12 @@ public:
         if (!layout_.supported) {
             throw std::invalid_argument(unsupported_mapper_reason(rom_.metadata));
         }
+        if (layout_.bank_kind >= kBankKindCnrom) {
+            // CNROM/MMC1/MMC2/MMC3 run only on the batched (CUDA/host) path.
+            throw std::invalid_argument("the scalar Console implements NROM, UxROM, UN1ROM and "
+                                        "BNROM only; " + to_string(rom_.metadata.mapper) +
+                                        " runs on the batched console");
+        }
         if (rom_.prg_rom.empty()) {
             throw std::invalid_argument("Console requires PRG ROM bytes");
         }

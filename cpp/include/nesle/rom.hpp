@@ -26,6 +26,7 @@ struct RomMetadata {
     NametableArrangement nametable_arrangement = NametableArrangement::Vertical;
     std::size_t prg_rom_size = 0;
     std::size_t chr_rom_size = 0;
+    std::uint32_t crc32 = 0;  // of PRG + CHR, as FCEUmm's database keys it (set by parse_ines)
 
     [[nodiscard]] bool is_nrom() const noexcept;
     [[nodiscard]] bool is_uxrom() const noexcept;
@@ -36,12 +37,65 @@ struct RomMetadata {
 constexpr std::uint8_t kBankKindNone = 0;
 constexpr std::uint8_t kBankKindUxrom16k = 1;
 constexpr std::uint8_t kBankKindBnrom32k = 2;
+constexpr std::uint8_t kBankKindCnrom = 3;
+constexpr std::uint8_t kBankKindMmc1 = 4;
+constexpr std::uint8_t kBankKindMmc2 = 5;
+constexpr std::uint8_t kBankKindMmc3 = 6;
+constexpr std::uint8_t kBankKindAxrom = 7;
+constexpr std::uint8_t kBankKindColorDreams = 8;
+constexpr std::uint8_t kBankKindGxrom = 9;
+constexpr std::uint8_t kBankKindCamerica = 10;
+constexpr std::uint8_t kBankKindNina0306 = 11;
+constexpr std::uint8_t kBankKindHes = 12;
+constexpr std::uint8_t kBankKindJaleco140 = 13;
+constexpr std::uint8_t kBankKindBitCorp38 = 14;
+constexpr std::uint8_t kBankKindJaleco87 = 15;
+constexpr std::uint8_t kBankKindVrc21 = 16;
+constexpr std::uint8_t kBankKindVrc22 = 17;
+constexpr std::uint8_t kBankKindVrc23 = 18;
+constexpr std::uint8_t kBankKindVrc25 = 19;
+constexpr std::uint8_t kBankKindVrc6a = 20;
+constexpr std::uint8_t kBankKindVrc6b = 21;
+constexpr std::uint8_t kBankKindSmb2j40 = 22;
+constexpr std::uint8_t kBankKindQuattro = 23;
+constexpr std::uint8_t kBankKindFme7 = 24;
+constexpr std::uint8_t kBankKindNina001 = 25;
+constexpr std::uint8_t kBankKindM15 = 26;
+constexpr std::uint8_t kBankKindIrem32 = 27;
+constexpr std::uint8_t kBankKindNamco88 = 28;
+constexpr std::uint8_t kBankKindM91 = 29;
+constexpr std::uint8_t kBankKindM42 = 30;
+constexpr std::uint8_t kBankKindM228 = 31;
+constexpr std::uint8_t kBankKindM83 = 32;
+constexpr std::uint8_t kBankKindJy90 = 33;
+constexpr std::uint8_t kBankKindVrc1 = 34;
+constexpr std::uint8_t kBankKindM246 = 35;
+constexpr std::uint8_t kBankKindSa72008 = 36;
+constexpr std::uint8_t kBankKindM243 = 37;
+constexpr std::uint8_t kBankKindM188 = 38;
+constexpr std::uint8_t kBankKindVrc3 = 39;
+constexpr std::uint8_t kBankKindM227 = 40;
+constexpr std::uint8_t kBankKindM8 = 41;
+constexpr std::uint8_t kBankKindCprom = 42;
+constexpr std::uint8_t kBankKindTaito48 = 43;
+constexpr std::uint8_t kBankKindJaleco18 = 44;
+constexpr std::uint8_t kBankKindM117 = 45;
+constexpr std::uint8_t kBankKindM222 = 46;
+constexpr std::uint8_t kBankKindBandai16 = 47;
+constexpr std::uint8_t kBankKindFfe = 48;
+constexpr std::uint8_t kBankKindN163 = 49;
+constexpr std::uint8_t kBankKindSunsoft4 = 50;
+constexpr std::uint8_t kBankKindMmc5 = 51;
 
 // iNES mapper numbers with a banking path. Mirrored in nesle::cuda.
 constexpr std::uint16_t kMapperNrom = 0;
 constexpr std::uint16_t kMapperUxrom = 2;
 constexpr std::uint16_t kMapperBnrom = 34;
 constexpr std::uint16_t kMapperUn1rom = 94;
+constexpr std::uint16_t kMapperMmc1 = 1;
+constexpr std::uint16_t kMapperCnrom = 3;
+constexpr std::uint16_t kMapperMmc3 = 4;
+constexpr std::uint16_t kMapperMmc2 = 9;
 
 // Window geometry of a banked cartridge, derived once from the iNES header.
 // `window_bytes == 0` means the board has no register at all (NROM), which is
@@ -54,12 +108,19 @@ struct MapperLayout {
     std::uint8_t bank_kind = 0;       // nesle::cuda::BankKind
     bool bus_conflicts = false;
     bool supported = false;
+    // Paged boards (CNROM, MMC1, MMC2, MMC3): 8 KB PRG pages - 1 and 1 KB CHR
+    // pages - 1 (of the CHR ROM, or of 8 KB CHR RAM). The window fields above
+    // stay zero for them.
+    std::uint16_t prg_page_mask = 0;
+    std::uint16_t chr_page_mask = 0;
+    std::uint32_t ext_ram_bytes = 0;  // per-env board memory beyond the shared arrays (MMC5), 0 = none
 };
 
 struct RomImage {
     RomMetadata metadata;
     std::vector<std::uint8_t> prg_rom;
     std::vector<std::uint8_t> chr_rom;
+    std::vector<std::uint8_t> trainer;  // the 512-byte trainer, if the header has one (FCEUmm writes it to $7000)
 };
 
 [[nodiscard]] RomImage parse_ines(std::span<const std::uint8_t> bytes);

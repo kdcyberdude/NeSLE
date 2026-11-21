@@ -20,12 +20,27 @@ __global__ void step_reward_kernel(BatchBuffers buffers, std::uint32_t num_envs)
 // the host in launch_console_step_kernel. Keeping them in one __global__ would
 // make ptxas allocate for the worse of the two bodies and cost occupancy on the
 // NROM path (measured: 72 registers versus 56 when both live in one kernel).
+//
+// The frame log's once-a-frame work (batch_frame.cuh) is called out of line and takes
+// `buffers` by reference. A __grid_constant__ parameter lets that reference point at the
+// launch parameter itself; otherwise the kernel copies it to local memory and loads every
+// buffer pointer from there (sm_70+; nothing here writes the struct, only what it points
+// at). The cap (96 registers, 5 blocks per SM) keeps the occupancy NROM and banked
+// boards had before those calls (94; paged boards had 72): without it the calls'
+// register needs raise the whole kernel to ~160.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+#define NESLE_STEP_GRID_CONSTANT
+#else
+#define NESLE_STEP_GRID_CONSTANT __grid_constant__
+#endif
 template <BankMode Mode>
-__global__ void console_step_kernel(BatchBuffers buffers,
-                                    std::uint32_t num_envs,
-                                    std::uint32_t frameskip,
-                                    std::uint64_t max_instructions_per_frame,
-                                    ConsoleStepStats stats) {
+__global__ void __launch_bounds__(128, 5)
+    console_step_kernel(const NESLE_STEP_GRID_CONSTANT BatchBuffers param,
+                        std::uint32_t num_envs,
+                        std::uint32_t frameskip,
+                        std::uint64_t max_instructions_per_frame,
+                        ConsoleStepStats stats) {
+    BatchBuffers& buffers = const_cast<BatchBuffers&>(param);
     const auto env = blockIdx.x * blockDim.x + threadIdx.x;
     if (env >= num_envs) {
         return;
@@ -51,7 +66,7 @@ __global__ void console_step_kernel(BatchBuffers buffers,
     // accumulated span reaches the next event horizon. Between settles the
     // register-resident PPU state the bus reads is exact by construction.
     std::uint32_t pending_ppu_cycles = 0;
-    std::uint32_t dots_to_next_event = batch_ppu_cycles_until_next_timing_event_hot(hot);
+    std::uint32_t dots_to_next_event = batch_ppu_cycles_until_next_event_hot<Mode>(buffers, env, hot);
     std::uint64_t total_instructions = 0;
     std::uint32_t total_frames_completed = 0;
     std::uint32_t budget_hits = 0;
@@ -64,15 +79,16 @@ __global__ void console_step_kernel(BatchBuffers buffers,
         while (instructions < max_instructions_per_frame && frames_completed == 0) {
             if (pending_ppu_cycles >= dots_to_next_event) {
                 const auto settled =
-                    batch_ppu_step_env_hot(buffers, env, pending_ppu_cycles, hot);
+                    batch_ppu_step_env_hot<Mode>(buffers, env, pending_ppu_cycles, hot);
                 frames_completed += settled.frames_completed;
                 pending_ppu_cycles = 0;
-                dots_to_next_event = batch_ppu_cycles_until_next_timing_event_hot(hot);
+                dots_to_next_event = batch_ppu_cycles_until_next_event_hot<Mode>(buffers, env, hot);
                 if (frames_completed != 0) {
                     break;
                 }
             }
-            const auto step = step_batch_console_instruction_lazy<Mode>(buffers, env, state, hot);
+            const auto step =
+                step_batch_console_instruction_lazy<Mode>(buffers, env, state, hot, pending_ppu_cycles);
             if (step.cpu.illegal) {
                 // An opcode the core does not implement. This used to compile to
                 // asm("trap;") inside cpu::step, which aborts the entire launch: one
@@ -93,7 +109,7 @@ __global__ void console_step_kernel(BatchBuffers buffers,
                 }
                 if (pending_ppu_cycles != 0) {
                     const auto settled =
-                        batch_ppu_step_env_hot(buffers, env, pending_ppu_cycles, hot);
+                        batch_ppu_step_env_hot<Mode>(buffers, env, pending_ppu_cycles, hot);
                     frames_completed += settled.frames_completed;
                     pending_ppu_cycles = 0;
                 }
@@ -111,21 +127,21 @@ __global__ void console_step_kernel(BatchBuffers buffers,
             if (step.cpu.opcode == 0x4C && state.pc == step.cpu.pc && frames_completed == 0) {
                 // Idle loop: settle what we owe, then fast-forward to the event.
                 const auto settled =
-                    batch_ppu_step_env_hot(buffers, env, pending_ppu_cycles, hot);
+                    batch_ppu_step_env_hot<Mode>(buffers, env, pending_ppu_cycles, hot);
                 frames_completed += settled.frames_completed;
                 pending_ppu_cycles = 0;
                 const auto fast_forward =
-                    fast_forward_batch_console_idle_loop_hot(buffers, env, state, hot);
+                    fast_forward_batch_console_idle_loop_hot<Mode>(buffers, env, state, hot);
                 frames_completed += fast_forward.frames_completed;
-                dots_to_next_event = batch_ppu_cycles_until_next_timing_event_hot(hot);
+                dots_to_next_event = batch_ppu_cycles_until_next_event_hot<Mode>(buffers, env, hot);
             }
         }
         // Settle the tail so frame accounting is exact at frameskip boundaries.
         if (pending_ppu_cycles != 0) {
-            const auto settled = batch_ppu_step_env_hot(buffers, env, pending_ppu_cycles, hot);
+            const auto settled = batch_ppu_step_env_hot<Mode>(buffers, env, pending_ppu_cycles, hot);
             frames_completed += settled.frames_completed;
             pending_ppu_cycles = 0;
-            dots_to_next_event = batch_ppu_cycles_until_next_timing_event_hot(hot);
+            dots_to_next_event = batch_ppu_cycles_until_next_event_hot<Mode>(buffers, env, hot);
         }
         total_instructions += instructions;
         total_frames_completed += frames_completed;
@@ -162,29 +178,31 @@ __global__ void console_step_kernel(BatchBuffers buffers,
     }
 }
 
-// One block per env; threads stride over the frame's pixels. Each pixel is a
-// pure function of PPU state (see render_batch_rgb_pixel_env), and every
-// thread owns the pixels it writes, so no synchronization is needed.
+// One block per env: thread 0 replays the frame's log once to get FCEUmm's state at the
+// start of every line, then the threads draw lines in parallel from those states.
 __global__ void render_rgb_kernel(BatchBuffers buffers, std::uint32_t num_envs) {
+    __shared__ ReplayState states[kFrameHeight];
     const auto env = blockIdx.x;
     if (env >= num_envs) {
         return;
     }
-    // Resolving the presentation-snapshot views is a handful of loads and
-    // pointer swaps; redoing it per thread is cheaper than staging it through
-    // shared memory.
-    auto views = resolve_render_env_views(buffers, env);
-    constexpr std::uint32_t kPixels = kFrameWidth * kFrameHeight;
-    for (std::uint32_t pixel = threadIdx.x; pixel < kPixels; pixel += blockDim.x) {
-        render_batch_rgb_pixel_env(buffers, views.hud, views.play, env, views.split_y, pixel);
+    std::uint32_t scratch[kLogHeaderWords];
+    const ReplaySource src = render_source(buffers, env, scratch);
+    if (threadIdx.x == 0) {
+        render_line_states(src, states);
+    }
+    __syncthreads();
+    std::uint8_t* frame = env_frame_rgb(buffers, env);
+    ReplayLine line;
+    for (std::uint32_t l = threadIdx.x; l < kFrameHeight; l += blockDim.x) {
+        ReplayState s = states[l];
+        render_line_rgb(src, s, line, static_cast<int>(l), frame + l * kFrameWidth * kRgbChannels);
     }
 }
 
-// One thread per env, serial frame paint. The per-pixel kernel above checks
-// every sprite per pixel, which costs more total arithmetic; once the env
-// count alone saturates the GPU, the serial per-env renderer wins (measured
-// crossover ~ several hundred envs on a GTX 1050 Ti: 2.9x faster per-pixel at
-// 256 envs, 1.5x slower at 2048).
+// One thread per env, serial frame paint: once the env count alone saturates the GPU
+// (measured crossover ~ several hundred envs on a GTX 1050 Ti for the earlier
+// renderer) this does less total work.
 __global__ void render_rgb_kernel_serial(BatchBuffers buffers, std::uint32_t num_envs) {
     const auto env = blockIdx.x * blockDim.x + threadIdx.x;
     if (env >= num_envs) {
@@ -217,6 +235,13 @@ void launch_console_step_kernel(const BatchBuffers& buffers,
             config.frameskip,
             max_instructions_per_frame,
             stats);
+    } else if (buffers.cart.bank_kind >= kBankingFirstPaged) {
+        console_step_kernel<kBankModePaged><<<blocks, kThreads, 0, stream>>>(
+            buffers,
+            config.num_envs,
+            config.frameskip,
+            max_instructions_per_frame,
+            stats);
     } else {
         console_step_kernel<kBankModeBanked><<<blocks, kThreads, 0, stream>>>(
             buffers,
@@ -230,7 +255,7 @@ void launch_console_step_kernel(const BatchBuffers& buffers,
 void launch_render_kernel(const BatchBuffers& buffers, StepConfig config, cudaStream_t stream) {
     constexpr int kThreads = 256;
     // Small batches (recording, eval, pixel obs on few envs): block-per-env,
-    // threads cooperate on pixels. Large batches: the env count already
+    // threads cooperate on lines. Large batches: the env count already
     // saturates the GPU and the serial per-env paint does less total work.
     constexpr std::uint32_t kPerPixelMaxEnvs = 512;
     if (config.num_envs <= kPerPixelMaxEnvs) {
@@ -250,6 +275,16 @@ __global__ void reset_console_envs_kernel(BatchBuffers buffers,
     const auto env = blockIdx.x * blockDim.x + threadIdx.x;
     if (env < num_envs && mask[env] != 0) {
         cold_reset_console_env(buffers, env);
+    }
+}
+
+__global__ void seed_frame_log_kernel(BatchBuffers buffers, std::uint32_t num_envs) {
+    const auto env = blockIdx.x * blockDim.x + threadIdx.x;
+    if (env < num_envs) {
+        frame_log_reset(buffers, env);
+        if (buffers.ppu.sprite0_dot != nullptr) {
+            buffers.ppu.sprite0_dot[env] = 0;
+        }
     }
 }
 
@@ -288,6 +323,12 @@ void launch_reset_envs_kernel(const BatchBuffers& buffers,
         reset_synthetic_envs_kernel<<<blocks, kThreads, 0, stream>>>(
             buffers, device_mask, num_envs);
     }
+}
+
+void launch_seed_frame_log_kernel(const BatchBuffers& buffers, std::uint32_t num_envs, cudaStream_t stream) {
+    constexpr int kThreads = 256;
+    const int blocks = static_cast<int>((num_envs + kThreads - 1) / kThreads);
+    seed_frame_log_kernel<<<blocks, kThreads, 0, stream>>>(buffers, num_envs);
 }
 
 void launch_snapshot_reset_envs_kernel(const BatchBuffers& buffers,

@@ -347,7 +347,20 @@ void check_bus_conflicts() {
 }
 
 void check_unsupported() {
-    for (std::uint16_t mapper : {1, 3, 4, 7, 9, 66, 71, 255}) {
+    // CNROM, MMC1, MMC3 and MMC2 are paged boards of the batched console only;
+    // the scalar reference Console still refuses them.
+    for (std::uint16_t mapper : {1, 3, 4, 9}) {
+        const auto rom = make_rom(mapper, 64 * 1024, 8 * 1024);
+        assert(nesle::describe_mapper(rom.metadata).supported);
+        bool threw = false;
+        try {
+            nesle::Console console(rom);
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        assert(threw);
+    }
+    for (std::uint16_t mapper : {7, 66, 71, 255}) {
         const auto rom = make_rom(mapper, 64 * 1024, 8 * 1024);
         const auto layout = nesle::describe_mapper(rom.metadata);
         assert(!layout.supported);

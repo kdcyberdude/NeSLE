@@ -106,7 +106,7 @@ class MapperSupportTests(unittest.TestCase):
         self.assertFalse(nina.is_supported)
 
     def test_unsupported_mappers(self):
-        for mapper in (1, 3, 4, 7, 9, 66, 71, 11, 30, 180):
+        for mapper in (7, 66, 71, 11, 30, 180):
             rom = make_mapper_rom(mapper)
             self.assertFalse(rom.is_supported, mapper)
             self.assertIn("unsupported mapper", rom.unsupported_reason)
